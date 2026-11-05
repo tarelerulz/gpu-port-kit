@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 tools/exec_big
 tools/exec_big.c
+tools/exec_prof

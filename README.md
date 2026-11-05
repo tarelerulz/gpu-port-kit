@@ -63,7 +63,18 @@ Config (`gpuport/config.py`) can be overridden with env vars: `GPUPORT_SHADERS` 
 | arena fits exec batch buffer (8M floats) and weights (32M floats) | `Arena` limit, `run()` check |
 | signed positions, vec4 alignment, no 64-way shared reductions | not checkable by the kit; see the rules note |
 
+## nemo8 proof and speed
+- `python3 tests/nemo8_rebuild.py`: rebuild check (weights, logits vs production, tokens vs C reference).
+- `python3 tools/nemo8_bench.py 3`: GPU vs CPU speed, writes GPU_NEMO8_BENCH.md.
+- `python3 tools/profile_nemo8.py tarel40`: per-dispatch GPU profile (needs tools/exec_prof).
+- `python3 tools/bench_gemm.py`: matmul kernels at nemo8 shapes (GPU_GEMM_BENCH.md).
+- `shaders/`: kit shaders (fe_frame_s, fe_conv0_v2, fe_im2col_v2, gemm12v), merged with the oido and stream shaders by `merged_shader_dir()`.
+
+## Resident server
+- `gpuport/server.py`: `ExecServer(weights, shader_dir)` drives oido's `exec_server2` (weights loaded once). Used by `tools/nemo8_bench.py`.
+
 ## Build helpers
+- `tools/build_exec_prof.py`: builds `tools/exec_prof` (per-dispatch timestamps, 24M arena).
 - `tools/build_exec_big.sh`: builds `tools/exec_big` (exec with a 24M arena) from ~/oido/port/gpu/exec.c. Needed by `tests/nemo8_rebuild.py`.
 
 ## Limits

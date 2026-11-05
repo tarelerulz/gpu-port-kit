@@ -1,0 +1,28 @@
+#version 450
+// conv0 (3x3, stride 2, pad 1, 1 input channel, + bias, relu), one thread per (t2, f) computing all sc channels.
+// Same arithmetic order as fe_conv0.comp (bias, then taps dt, df in order), so results are bit-identical.
+// Input taps outside the signal are read as 0; adding 0*w leaves the sum unchanged.
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    uint Tm = p.u[0], fO = p.u[1], oO = p.u[2], wO = p.u[3], bO = p.u[4], sc = p.u[5], T2 = p.u[6];
+    if (id >= T2 * 40u) return;
+    uint t2 = id / 40u, f = id % 40u;
+    float x[9];
+    for (uint dt = 0u; dt < 3u; dt++) {
+        int r = int(2u * t2) + int(dt) - 1;
+        for (uint df = 0u; df < 3u; df++) {
+            int c = int(2u * f) + int(df) - 1;
+            x[dt * 3u + df] = (r >= 0 && r < int(Tm) && c >= 0 && c < 80) ? a[fO + uint(r) * 80u + uint(c)] : 0.0;
+        }
+    }
+    uint ob = oO + (t2 * 40u + f) * sc;
+    for (uint ch = 0u; ch < sc; ch++) {
+        float acc = w[bO + ch];
+        for (uint j = 0u; j < 9u; j++) acc += w[wO + ch * 9u + j] * x[j];
+        a[ob + ch] = max(acc, 0.0);
+    }
+}

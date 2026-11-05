@@ -1,0 +1,24 @@
+#version 450
+// frames with a padded row stride: fr[t][i] = window[i] * preemph(x)[160t - 200 + i] for i < 512 (zero for i >= 400),
+// row t starts at frO + t*FRS. FRS (push u[5]) must not be a power of two: a 512-float row stride made the
+// following matmul 7x slower (measured 2026-11-04, tools/bench_gemm.py notes).
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    uint Tm = p.u[0], n = p.u[1], xO = p.u[2], frO = p.u[3], winO = p.u[4], FRS = p.u[5];
+    if (id >= Tm * 512u) return;
+    uint t = id / 512u, i = id % 512u;
+    float v = 0.0;
+    if (i < 400u) {
+        int s = int(160u * t) - 200 + int(i);
+        if (s >= 0 && s < int(n)) {
+            float x0 = a[xO + uint(s)];
+            float pv = (s == 0) ? x0 : (x0 - 0.97 * a[xO + uint(s - 1)]);
+            v = pv * w[winO + i];
+        }
+    }
+    a[frO + t * FRS + i] = v;
+}

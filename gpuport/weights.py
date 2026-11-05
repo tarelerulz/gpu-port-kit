@@ -19,16 +19,29 @@ class Weights:
         self.parts.append(arr); self.size += arr.size
         return off
 
-    def put_mm(self, Wm, bias=None):
-        """Wm: [N][K] (torch/nn layout). Returns dict(wo, bo, n, k, np) for gemm12 pushes."""
+    def put_mm(self, Wm, bias=None, pad=12):
+        """Wm: [N][K] (torch/nn layout). Returns dict(wo, bo, n, k, np) for gemm12 (pad=12) or gemm4 (pad=4)."""
         Wm = np.asarray(Wm, np.float32)
         n, k = Wm.shape
-        NP = roundup(n, 12)
+        NP = roundup(n, pad)
         Wt = np.zeros((k, NP), np.float32); Wt[:, :n] = Wm.T
         bp = np.zeros(NP, np.float32)
         if bias is not None:
             bp[:n] = np.asarray(bias, np.float32)
         return dict(wo=self.put(Wt), bo=self.put(bp), n=n, k=k, np=NP)
+
+    def put_mm4(self, Wm, bias=None):
+        """Weights for gemm_k5 (oido stream/gemm_k5.comp): vec4 per (output group cg, k) holding outputs cg*4..cg*4+3.
+        Stored as [NP/4][K][4]. Bias padded to NP (float). Returns dict(wo4, bo, n, k, np)."""
+        Wm = np.asarray(Wm, np.float32)
+        n, k = Wm.shape
+        NP = roundup(n, 4)
+        Wp = np.zeros((NP, k), np.float32); Wp[:n] = Wm
+        w4 = Wp.reshape(NP // 4, 4, k).transpose(0, 2, 1).copy()      # [cg][k][j]
+        bp = np.zeros(NP, np.float32)
+        if bias is not None:
+            bp[:n] = np.asarray(bias, np.float32)
+        return dict(wo4=self.put(w4), bo=self.put(bp), n=n, k=k, np=NP)
 
     def save(self, prefix, layout=None):
         """Writes <prefix>.bin (float32 LE) and <prefix>.json (layout dict, optional)."""

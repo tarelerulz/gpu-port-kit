@@ -20,7 +20,7 @@ def _zeros_weights(work):
 
 
 def run(plan, arena_init, out_off, out_n, weights=None, shader_dir=SHADER_DIR, exec_bin=EXEC_BIN,
-        work=WORK_DIR, lint=True, arena_floats=EXEC_ARENA_FLOATS):
+        work=WORK_DIR, lint=True, arena_floats=EXEC_ARENA_FLOATS, prof=None):
     """plan: Plan. arena_init: float32 array (words before its end are the start arena; rest is zero).
     weights: path to a float32 .bin, or None. Returns (out float32[out_n], submit_ms)."""
     if isinstance(plan, (list, tuple)):
@@ -39,6 +39,8 @@ def run(plan, arena_init, out_off, out_n, weights=None, shader_dir=SHADER_DIR, e
     arena_init.astype('<f4').tofile(base + '.arena_in')
     wpath = weights or _zeros_weights(work)
     env = dict(os.environ, **VK_ENV)
+    if prof:
+        env['EXEC_PROF'] = prof          # exec_prof writes one line per dispatch
     r = subprocess.run([exec_bin, base + '.plan', base + '.arena_in', wpath, base + '.arena_out',
                         str(out_off), str(out_n)], env=env, cwd=shader_dir, capture_output=True, text=True)
     if r.returncode != 0:

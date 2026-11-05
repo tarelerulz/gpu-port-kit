@@ -1,0 +1,88 @@
+#version 450
+// gemm12 variant: same tile (12 outputs x 4 rows per thread, weights [K][NP] with NP % 12 == 0, bias float at bo),
+// but A is read as vec4 along K (4 k-values per load). Needs K % 4 == 0, sAm % 4 == 0, a_off % 4 == 0.
+// Inner k loop unrolled by hand: variable component indexing (x[kk]) was slow on this GPU.
+// Push words as gemm12: 0 M 1 N 2 K 3 NP | 4 A, 5 sAm | 7 W | 8 bias (0xffffffff none) | 9 out, 10 sOm, 11 sOn | 12 epi.
+// One invocation per (12-output group cg, 4-row group rg); idx = cg * RG + rg with RG = ceil(M/4).
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(std430, binding = 0) buffer A4 { vec4 a4[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(std430, binding = 1) readonly buffer W4 { vec4 w4[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+float act(float v, uint op) {
+    if (op == 2u) return v / (1.0 + exp(-v));
+    if (op == 3u) return max(v, 0.0);
+    if (op == 1u) return v * clamp(v / 6.0 + 0.5, 0.0, 1.0);
+    if (op == 4u) return 1.0 / (1.0 + exp(-v));
+    return v;
+}
+void main() {
+    uint M = p.u[0], N = p.u[1], K = p.u[2], NP = p.u[3];
+    uint Ab = p.u[4], sAm = p.u[5], Wo = p.u[7], bo = p.u[8], ob = p.u[9], sOm = p.u[10], sOn = p.u[11], epi = p.u[12];
+    uint RG = (M + 3u) / 4u;
+    uint idx = gl_GlobalInvocationID.x;
+    uint cg = idx / RG, rg = idx % RG;
+    if (cg * 12u >= NP) return;
+    uint m0 = rg * 4u;
+    uint ar0 = Ab + min(m0, M - 1u) * sAm, ar1 = Ab + min(m0 + 1u, M - 1u) * sAm;
+    uint ar2 = Ab + min(m0 + 2u, M - 1u) * sAm, ar3 = Ab + min(m0 + 3u, M - 1u) * sAm;
+    vec4 s00 = vec4(0.0), s01 = s00, s02 = s00, s10 = s00, s11 = s00, s12 = s00;
+    vec4 s20 = s00, s21 = s00, s22 = s00, s30 = s00, s31 = s00, s32 = s00;
+    uint wb = Wo / 4u + cg * 3u;
+    uint ws = NP / 4u;
+    for (uint k = 0u; k < K; k += 4u) {
+        vec4 x0 = a4[(ar0 + k) / 4u], x1 = a4[(ar1 + k) / 4u], x2 = a4[(ar2 + k) / 4u], x3 = a4[(ar3 + k) / 4u];
+        {
+            uint wr = wb + (k + 0u) * ws;
+            vec4 w0 = w4[wr], w1 = w4[wr + 1u], w2 = w4[wr + 2u];
+            float v0 = x0.x, v1 = x1.x, v2 = x2.x, v3 = x3.x;
+            s00 += v0 * w0; s01 += v0 * w1; s02 += v0 * w2;
+            s10 += v1 * w0; s11 += v1 * w1; s12 += v1 * w2;
+            s20 += v2 * w0; s21 += v2 * w1; s22 += v2 * w2;
+            s30 += v3 * w0; s31 += v3 * w1; s32 += v3 * w2;
+        }
+        {
+            uint wr = wb + (k + 1u) * ws;
+            vec4 w0 = w4[wr], w1 = w4[wr + 1u], w2 = w4[wr + 2u];
+            float v0 = x0.y, v1 = x1.y, v2 = x2.y, v3 = x3.y;
+            s00 += v0 * w0; s01 += v0 * w1; s02 += v0 * w2;
+            s10 += v1 * w0; s11 += v1 * w1; s12 += v1 * w2;
+            s20 += v2 * w0; s21 += v2 * w1; s22 += v2 * w2;
+            s30 += v3 * w0; s31 += v3 * w1; s32 += v3 * w2;
+        }
+        {
+            uint wr = wb + (k + 2u) * ws;
+            vec4 w0 = w4[wr], w1 = w4[wr + 1u], w2 = w4[wr + 2u];
+            float v0 = x0.z, v1 = x1.z, v2 = x2.z, v3 = x3.z;
+            s00 += v0 * w0; s01 += v0 * w1; s02 += v0 * w2;
+            s10 += v1 * w0; s11 += v1 * w1; s12 += v1 * w2;
+            s20 += v2 * w0; s21 += v2 * w1; s22 += v2 * w2;
+            s30 += v3 * w0; s31 += v3 * w1; s32 += v3 * w2;
+        }
+        {
+            uint wr = wb + (k + 3u) * ws;
+            vec4 w0 = w4[wr], w1 = w4[wr + 1u], w2 = w4[wr + 2u];
+            float v0 = x0.w, v1 = x1.w, v2 = x2.w, v3 = x3.w;
+            s00 += v0 * w0; s01 += v0 * w1; s02 += v0 * w2;
+            s10 += v1 * w0; s11 += v1 * w1; s12 += v1 * w2;
+            s20 += v2 * w0; s21 += v2 * w1; s22 += v2 * w2;
+            s30 += v3 * w0; s31 += v3 * w1; s32 += v3 * w2;
+        }
+    }
+    vec4 b0 = vec4(0.0), b1 = vec4(0.0), b2 = vec4(0.0);
+    if (bo != 0xffffffffu) { uint bb = bo / 4u + cg * 3u; b0 = w4[bb]; b1 = w4[bb + 1u]; b2 = w4[bb + 2u]; }
+    vec4 S[4][3];
+    S[0][0] = s00 + b0; S[0][1] = s01 + b1; S[0][2] = s02 + b2;
+    S[1][0] = s10 + b0; S[1][1] = s11 + b1; S[1][2] = s12 + b2;
+    S[2][0] = s20 + b0; S[2][1] = s21 + b1; S[2][2] = s22 + b2;
+    S[3][0] = s30 + b0; S[3][1] = s31 + b1; S[3][2] = s32 + b2;
+    for (uint m = 0u; m < 4u; m++) {
+        if (m0 + m >= M) continue;
+        for (uint g = 0u; g < 3u; g++)
+            for (uint c = 0u; c < 4u; c++) {
+                uint n = cg * 12u + g * 4u + c;
+                if (n < N) a[ob + (m0 + m) * sOm + n * sOn] = act(S[m][g][c], epi);
+            }
+    }
+}

@@ -21,3 +21,22 @@ MIN_WORKGROUPS = 24       # fewer gave wrong gemm12 output at some shapes
 MAX_GROUP_DIM = 65535     # dispatch limit per dimension
 MAX_PUSH = 32             # exec sends 32 uint push words
 GEMM12_MAX_ROWS = 251     # gemm12 only correct for row blocks <= 251
+
+KIT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+KIT_SHADERS = os.path.join(KIT_ROOT, 'shaders')
+STREAM_SHADERS = os.path.expanduser('~/oido/port/stream')   # gemm_k5 and other streaming shaders
+
+
+def merged_shader_dir(extra=(KIT_SHADERS,), base=None):
+    """Folder with symlinks to the oido shaders plus the kit's own shaders (kit wins on a name clash).
+    exec loads <name>.spv from its cwd, so plans that use both need this folder."""
+    import glob
+    out = os.path.join(WORK_DIR, 'shaders')
+    os.makedirs(out, exist_ok=True)
+    for src in [base or SHADER_DIR, *extra]:
+        for f in glob.glob(os.path.join(src, '*.spv')) + glob.glob(os.path.join(src, '*.comp')):
+            dst = os.path.join(out, os.path.basename(f))
+            if os.path.lexists(dst):
+                os.remove(dst)
+            os.symlink(os.path.abspath(f), dst)
+    return out
