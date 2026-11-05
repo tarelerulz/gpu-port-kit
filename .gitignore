@@ -1,6 +1,10 @@
-work/
-__pycache__/
 *.pyc
+__pycache__/
 tools/exec_big
 tools/exec_big.c
+tools/exec_nospec
 tools/exec_prof
+tools/exec_server_fixed
+work/
+shaders/gemm_t_f16.spv
+shaders/gemm_t_f32.spv

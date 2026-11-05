@@ -3,7 +3,8 @@ import os
 
 # Directory holding exec.c's binary and the *.spv shaders (exec loads <name>.spv from its cwd).
 SHADER_DIR = os.environ.get('GPUPORT_SHADERS', os.path.expanduser('~/oido/port/gpu'))
-EXEC_BIN = os.environ.get('GPUPORT_EXEC', os.path.join(SHADER_DIR, 'exec'))
+# Default runner: the kit's fixed build (tools/build_exec_big.sh); oido's exec has the specialization-constant bug.
+EXEC_BIN = os.environ.get('GPUPORT_EXEC', os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'tools', 'exec_big'))
 # Scratch files (arena/plan/out). Not in /tmp on purpose.
 WORK_DIR = os.environ.get('GPUPORT_WORK', os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'work'))
 # PiOS Vulkan loader + v3dv driver (same as ~/opt/pios-vulkan/env.sh).
@@ -20,7 +21,8 @@ ALIGN = 64                # floats, arena region start
 MIN_WORKGROUPS = 24       # fewer gave wrong gemm12 output at some shapes
 MAX_GROUP_DIM = 65535     # dispatch limit per dimension
 MAX_PUSH = 32             # exec sends 32 uint push words
-GEMM12_MAX_ROWS = 251     # gemm12 only correct for row blocks <= 251
+GEMM12_MAX_ROWS = 251     # speed choice, not a correctness limit (2026-11-05): gemm12 is correct at any row count with
+                            # the fixed runner, but time per call jumps above ~251 rows (conv2 at 5020 rows took 2.6 s in one call).
 
 KIT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 KIT_SHADERS = os.path.join(KIT_ROOT, 'shaders')

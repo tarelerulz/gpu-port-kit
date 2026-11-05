@@ -12,6 +12,7 @@ OUT = os.path.join(HERE, 'exec_prof')
 PATCHES = [
     ("#define ARENA_FLOATS (8u << 20)", "#define ARENA_FLOATS (24u << 20)"),
     ("#define WEIGHT_FLOATS (32u << 20)", "#define WEIGHT_FLOATS (48u << 20)"),
+    ("uint32_t sd = local;", "uint32_t sd = 0xffffffffu;   /* fix: spec constant 0 is not the local size */"),
     ("int main(int argc, char **argv) {",
      "static float tperiod = 1.0f; static VkQueryPool tsqp;\nint main(int argc, char **argv) {"),
     ("    vkGetPhysicalDeviceMemoryProperties(phys, &mp);",

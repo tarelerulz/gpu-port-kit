@@ -1,0 +1,52 @@
+#version 450
+#extension GL_EXT_integer_dot_product : require
+// int8 linear layer: out[m][n] = epi( (sum_k Aq[m][k] * Wq[n][k]) * sa[m] * sw[n] + bias[n] ).
+// Aq: packed int8 rows from quant_rows.comp (qIn + m*KQ). Wq: packed int8 weights Wp[kq][n] (stride NP), sw[n] scales,
+// bias[n] (float). Tile: 12 outputs x 4 rows per thread (as gemm12). Push words:
+// 0 M 1 N 2 KQ 3 NP | 4 qIn 5 sa (row scales) | 7 Wo (packed) 8 bo (bias) 9 ob 10 sOm 12 epi 13 sw (weight scales)
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(std430, binding = 0) buffer AU { uint au[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(std430, binding = 1) readonly buffer WU { uint wu[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+float act(float v, uint op) {
+    if (op == 2u) return v / (1.0 + exp(-v));
+    if (op == 3u) return max(v, 0.0);
+    if (op == 4u) return 1.0 / (1.0 + exp(-v));
+    return v;
+}
+void main() {
+    uint M = p.u[0], N = p.u[1], KQ = p.u[2], NP = p.u[3];
+    uint qIn = p.u[4], sa = p.u[5], Wo = p.u[7], bo = p.u[8], ob = p.u[9], sOm = p.u[10], epi = p.u[12], sw = p.u[13];
+    uint RG = (M + 3u) / 4u;
+    uint idx = gl_GlobalInvocationID.x;
+    uint cg = idx / RG, rg = idx % RG;
+    if (cg * 12u >= NP) return;
+    uint m0 = rg * 4u;
+    uint r0 = qIn + min(m0, M - 1u) * KQ, r1 = qIn + min(m0 + 1u, M - 1u) * KQ;
+    uint r2 = qIn + min(m0 + 2u, M - 1u) * KQ, r3 = qIn + min(m0 + 3u, M - 1u) * KQ;
+    int acc0[12], acc1[12], acc2[12], acc3[12];
+    for (uint j = 0u; j < 12u; j++) { acc0[j] = 0; acc1[j] = 0; acc2[j] = 0; acc3[j] = 0; }
+    uint wb = Wo + cg * 12u;
+    for (uint q = 0u; q < KQ; q++) {
+        int x0 = int(au[r0 + q]), x1 = int(au[r1 + q]), x2 = int(au[r2 + q]), x3 = int(au[r3 + q]);
+        uint wr = wb + q * NP;
+        for (uint j = 0u; j < 12u; j++) {
+            int wv = int(wu[wr + j]);
+            acc0[j] += dotPacked4x8EXT(x0, wv);
+            acc1[j] += dotPacked4x8EXT(x1, wv);
+            acc2[j] += dotPacked4x8EXT(x2, wv);
+            acc3[j] += dotPacked4x8EXT(x3, wv);
+        }
+    }
+    for (uint j = 0u; j < 12u; j++) {
+        uint n = cg * 12u + j;
+        if (n >= N) continue;
+        float swn = w[sw + n], b = (bo == 0xffffffffu) ? 0.0 : w[bo + n];
+        if (m0 < M)      a[ob + m0 * sOm + n] = act(float(acc0[j]) * a[sa + m0] * swn + b, epi);
+        if (m0 + 1u < M) a[ob + (m0 + 1u) * sOm + n] = act(float(acc1[j]) * a[sa + m0 + 1u] * swn + b, epi);
+        if (m0 + 2u < M) a[ob + (m0 + 2u) * sOm + n] = act(float(acc2[j]) * a[sa + m0 + 2u] * swn + b, epi);
+        if (m0 + 3u < M) a[ob + (m0 + 3u) * sOm + n] = act(float(acc3[j]) * a[sa + m0 + 3u] * swn + b, epi);
+    }
+}

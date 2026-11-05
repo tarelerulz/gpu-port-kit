@@ -8,7 +8,7 @@ import numpy as np
 from .config import VK_ENV, WORK_DIR, EXEC_ARENA_FLOATS
 from .plan import Plan
 
-EXEC_SERVER2 = os.path.expanduser('~/oido/port/gpu/exec_server2')
+EXEC_SERVER2 = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'tools', 'exec_server_fixed')  # built by tools/build_exec_server.sh
 SERVER_ARENA_FLOATS = 24 << 20
 
 

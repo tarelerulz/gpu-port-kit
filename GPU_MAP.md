@@ -160,3 +160,48 @@ is inherent 1.4 GMAC; a real FFT would save about 0.1 s on the DFT part.
   The encoder has about 400 dispatches, so a 2 s phrase takes about 2.0 s, and a 10 s clip 3.9 s. The CPU path answers a short
   phrase in about 0.1 s. The menu option is for freeing the CPU, not for responsiveness.
 
+
+## 14. Number formats the GPU runs (corrected 2026-11-05)
+- The feature query (tools/gpufeatures.c) reported float16 "no" and int8 "no". Both were WRONG: running real shaders works.
+- Run tests (work/f64test): float16 multiply gives the right answer (6.0); int8 multiply gives the right answer (6).
+- Speed, float16 vs float32 (dependent multiply-add loop, 262 M ops): 656 ms vs 629 ms. No gain from float16 in this test.
+  The test is one dependent chain per thread, so it measures latency, not peak throughput. Not yet measured with independent work.
+- float64: does NOT run. The driver's compiler rejects it ("unknown NIR ALU inst: div 64") and the runner exits with code -6.
+  Do not run float64 in the resident server.
+- Lesson: the Vulkan feature flags are not a reliable test; run a shader that uses the format and check the answer.
+- float16 matmul (shaders/gemm_t.comp, same tile and layout for both builds, FF1 shape M=251 K=176 N=704):
+  float32 build 44.0 ms (0.71 GMAC/s); float16 build 59.5 ms (0.52 GMAC/s); max error 4e-3 (float16) vs 5e-7 (float32).
+  So float16 arithmetic is slower in this design, and less accurate. The data stayed float32 in the buffers (converted per load),
+  so this does NOT test float16 storage, which could still save memory and bandwidth. Not tested: int8 matmul speed.
+- int8 matmul (shaders/gemm_i8dot.comp, packed 4-way dot products, same 12x4 tile, FF1 shape M=251 K=176 N=704):
+  exact match with the integer reference (max diff 0); 14.7 ms (2.11 GMAC/s) vs gemm12 float32 16.3 ms (1.91 GMAC/s).
+  Versus the float32 build of the same simple tile (gemm_t, 44 ms), int8 is about 3x faster. Not tuned yet; weights are 4x smaller.
+  So int8 is about 10% faster than the tuned float32 kernel today, and the bigger win is memory.
+
+## 15. Full int8 model on the GPU (2026-11-05, tests/nemo8_int8.py)
+- nemo8 with int8 linear layers (encoder linears and head): activations quantized per row (shaders/quant_rows.comp),
+  packed int8 matmul with one scale per output row (shaders/gemm_i8.comp, gpuport/int8.py). Front end and attention stay float32.
+- One layer vs numpy with the same quantization: relative error 7e-8 (exact integer math).
+- Whole model: transcripts identical to the C reference on speak and tarel40. Argmax agreement with float32 99.2%.
+- Weight blob: 18.0 MB int8 vs 54.5 MB float32.
+- Speed: speak (5 s) 1849 ms vs 2562 ms float32 (single run each, not a median); tarel40 (10 s) 3905 ms vs 3924 ms: no gain.
+- Profile (tarel40): gemm_i8 1550 ms over 145 dispatches (10.7 ms each), gemm12 934 ms (front end and pos), attention scores 595 ms,
+  quantize 103 ms. Int8 matmul is only about 10% faster than float32 in this tile, so the model does not get faster.
+- Not wired into the menu. The float32 encoder remains the menu engine.
+
+## 16. Root cause of the "251-row limit" (found 2026-11-05)
+- The old rule "gemm12 is only correct up to 251 rows" was WRONG. It was a runner bug.
+- exec (oido gpu/exec.c and exec_server2.c) sets specialization constant 0 to the workgroup size (256). The shared header
+  (asr4all shaders/specialization.glsl) reads U(0) = M from that constant. So every gemm12 call saw M = 256.
+  Rows 256+ were never written, and rows 251-255 were written past the end of the output.
+- Proof: with the constant left unset (tools/exec_nospec, same kernel), gemm12 is correct at M = 251, 260, 502 and 1001
+  (max error 1.8e-7). Before the fix, rows 256 and up were wrong (bad rows exactly 256..M-1).
+- Fix: tools/build_exec_big.sh, tools/build_exec_prof.py and tools/build_exec_server.sh set the constant to 0xffffffff.
+  The kit uses these builds by default (GPUPORT_EXEC defaults to tools/exec_big; the server wrapper uses tools/exec_server_fixed).
+- Outputs did not change: nemo8 argmax vs the C reference is the same with the old and fixed runners (100% speak, 98.8% tarel40).
+- Speed: block size is still 251 rows, because time per call rises sharply above that: conv2 as one 5020-row call took 2.6 s.
+  Full nemo8 with the fixed runner: tarel40 3.89 s (kernel 3.88 s), speak 1.69 s (was 2.55 s with the bug). Server CPU 0.03 s.
+- oido's own runners are now fixed too (2026-11-05): ~/oido/port/gpu/exec, exec_server, exec_server2, exec_server_small.
+  Originals backed up in ~/oido/port/gpu/bak-2026-11-05-exec-fix/. The production encoder (gpu_encoder2) gives the same
+  transcripts and the kit rebuild check still matches it exactly.
+
