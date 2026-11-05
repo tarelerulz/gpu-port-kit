@@ -1,0 +1,51 @@
+#version 450
+// One source, two builds (glslc -DF16 for float16 arithmetic; default float32). Same tile and push layout as gemm12:
+// 12 outputs x 4 rows per thread, weights [K][NP] (NP % 12 == 0), A row-major with stride sAm, bias float at bo.
+// Data stays float32 in the buffers; the F16 build converts each loaded value and accumulates in float16.
+#ifdef F16
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#define T float16_t
+#define CVT(x) float16_t(x)
+#define OUT(x) float(x)
+#else
+#define T float
+#define CVT(x) (x)
+#define OUT(x) (x)
+#endif
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint M = p.u[0], N = p.u[1], K = p.u[2], NP = p.u[3];
+    uint Ab = p.u[4], sAm = p.u[5], Wo = p.u[7], bo = p.u[8], ob = p.u[9], sOm = p.u[10], sOn = p.u[11];
+    uint RG = (M + 3u) / 4u;
+    uint idx = gl_GlobalInvocationID.x;
+    uint cg = idx / RG, rg = idx % RG;
+    if (cg * 12u >= NP) return;
+    uint m0 = rg * 4u;
+    uint r0 = Ab + min(m0, M - 1u) * sAm, r1 = Ab + min(m0 + 1u, M - 1u) * sAm;
+    uint r2 = Ab + min(m0 + 2u, M - 1u) * sAm, r3 = Ab + min(m0 + 3u, M - 1u) * sAm;
+    T acc0[12], acc1[12], acc2[12], acc3[12];
+    for (uint j = 0u; j < 12u; j++) {
+        T b = (bo == 0xffffffffu) ? CVT(0.0) : CVT(w[bo + cg * 12u + j]);
+        acc0[j] = b; acc1[j] = b; acc2[j] = b; acc3[j] = b;
+    }
+    uint wb = Wo + cg * 12u;
+    for (uint k = 0u; k < K; k++) {
+        T x0 = CVT(a[r0 + k]), x1 = CVT(a[r1 + k]), x2 = CVT(a[r2 + k]), x3 = CVT(a[r3 + k]);
+        uint wr = wb + k * NP;
+        for (uint j = 0u; j < 12u; j++) {
+            T wv = CVT(w[wr + j]);
+            acc0[j] += x0 * wv; acc1[j] += x1 * wv; acc2[j] += x2 * wv; acc3[j] += x3 * wv;
+        }
+    }
+    for (uint j = 0u; j < 12u; j++) {
+        uint n = cg * 12u + j;
+        if (n >= N) continue;
+        if (m0 < M)     a[ob + m0 * sOm + n * sOn] = OUT(acc0[j]);
+        if (m0 + 1u < M) a[ob + (m0 + 1u) * sOm + n * sOn] = OUT(acc1[j]);
+        if (m0 + 2u < M) a[ob + (m0 + 2u) * sOm + n * sOn] = OUT(acc2[j]);
+        if (m0 + 3u < M) a[ob + (m0 + 3u) * sOm + n * sOn] = OUT(acc3[j]);
+    }
+}

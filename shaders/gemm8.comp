@@ -1,0 +1,46 @@
+#version 450
+// Float32 matmul, 12 outputs x 8 rows per thread (weights read once per 8 rows, half the weight traffic of gemm12).
+// Same push layout as gemm12 (0 M 1 N 2 K 3 NP | 4 A 5 sAm | 7 W | 8 bias | 9 out 10 sOm 11 sOn | 12 epi). Scalar loads.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+float act(float v, uint op) {
+    if (op == 2u) return v / (1.0 + exp(-v));
+    if (op == 3u) return max(v, 0.0);
+    if (op == 4u) return 1.0 / (1.0 + exp(-v));
+    return v;
+}
+void main() {
+    uint M = p.u[0], N = p.u[1], K = p.u[2], NP = p.u[3];
+    uint Ab = p.u[4], sAm = p.u[5], Wo = p.u[7], bo = p.u[8], ob = p.u[9], sOm = p.u[10], sOn = p.u[11], epi = p.u[12];
+    uint RG = (M + 7u) / 8u;
+    uint idx = gl_GlobalInvocationID.x;
+    uint cg = idx / RG, rg = idx % RG;
+    if (cg * 12u >= NP) return;
+    uint m0 = rg * 8u;
+    uint r[8];
+    for (uint i = 0u; i < 8u; i++) r[i] = Ab + min(m0 + i, M - 1u) * sAm;
+    float acc[8][12];
+    for (uint j = 0u; j < 12u; j++) {
+        float b = (bo == 0xffffffffu) ? 0.0 : w[bo + cg * 12u + j];
+        for (uint i = 0u; i < 8u; i++) acc[i][j] = b;
+    }
+    uint wb = Wo + cg * 12u;
+    for (uint k = 0u; k < K; k++) {
+        float x[8];
+        for (uint i = 0u; i < 8u; i++) x[i] = a[r[i] + k];
+        uint wr = wb + k * NP;
+        for (uint j = 0u; j < 12u; j++) {
+            float wv = w[wr + j];
+            for (uint i = 0u; i < 8u; i++) acc[i][j] += x[i] * wv;
+        }
+    }
+    for (uint i = 0u; i < 8u; i++) {
+        if (m0 + i >= M) continue;
+        for (uint j = 0u; j < 12u; j++) {
+            uint n = cg * 12u + j;
+            if (n < N) a[ob + (m0 + i) * sOm + n * sOn] = act(acc[i][j], epi);
+        }
+    }
+}
