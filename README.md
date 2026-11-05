@@ -11,6 +11,9 @@ It does not replace the method; it makes each step quick and enforces the rules.
 - `tools/devinfo.c`: device limits (build line in the file).
 - `python3 tests/run_all.py`: all checks (ops, weight layouts, attention).
 
+## Check the runner first
+- `python3 tests/check_runner.py`: runs unsplit matrix calls and fails if the runner is broken (it caught the row-count bug). Run it before trusting any GPU result. It is the first step of `tests/run_all.py`.
+
 ## Start a new port
 ```
 python3 ~/gpu-port-kit/scaffold.py ~/<model>-gpu <model>
