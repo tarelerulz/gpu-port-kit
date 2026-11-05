@@ -205,3 +205,10 @@ is inherent 1.4 GMAC; a real FFT would save about 0.1 s on the DFT part.
   Originals backed up in ~/oido/port/gpu/bak-2026-11-05-exec-fix/. The production encoder (gpu_encoder2) gives the same
   transcripts and the kit rebuild check still matches it exactly.
 
+## 17. Cost of one step (measured 2026-11-05; corrects section 13)
+- Trivial elementwise step: 0.033 ms each (400 steps = 13 ms). Fixed per-step overhead is small.
+- Matrix step with almost no work (K=4, N=12): 0.1-0.13 ms each.
+- Feed-forward matrix (251 rows, K=176, N=704): 16.1 ms each. This is the work of that matrix, not overhead.
+- So the "16 ms floor" in section 13 was the cost of the matrix size, not a per-step fixed cost. Combining steps would not
+  save much time. Short phrases are slow because each matrix still costs its full K x N work, whatever the row count.
+
