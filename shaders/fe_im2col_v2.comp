@@ -1,0 +1,25 @@
+#version 450
+// patches for conv2, one thread per (row, ch): P[row][ch*9 + q] = C0[2*t3+dt-1][2*f3+df-1][ch] (zero outside),
+// q = dt*3 + df, row = t3*20 + f3. Consecutive threads read consecutive channels (coalesced reads).
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    uint T3 = p.u[0], T2 = p.u[1], c0O = p.u[2], pO = p.u[3], sc = p.u[4];
+    uint rows = T3 * 20u;
+    if (id >= rows * sc) return;
+    uint ch = id % sc, row = id / sc;
+    uint t3 = row / 20u, f3 = row % 20u;
+    uint K = sc * 9u;
+    for (uint dt = 0u; dt < 3u; dt++) {
+        int r = int(2u * t3) + int(dt) - 1;
+        for (uint df = 0u; df < 3u; df++) {
+            int c = int(2u * f3) + int(df) - 1;
+            float v = 0.0;
+            if (r >= 0 && r < int(T2) && c >= 0 && c < 40) v = a[c0O + (uint(r) * 40u + uint(c)) * sc + ch];
+            a[pO + row * K + ch * 9u + dt * 3u + df] = v;
+        }
+    }
+}
