@@ -4,7 +4,7 @@ import os
 import subprocess
 import sys
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-steps = [['selftest.py'], ['tests/test_weight_layouts.py'], ['tests/test_attention_layout.py'], ['tests/nemo8_rebuild.py']]
+steps = [['tests/check_runner.py'], ['selftest.py'], ['tests/test_weight_layouts.py'], ['tests/test_attention_layout.py'], ['tests/nemo8_rebuild.py']]
 bad = []
 for s in steps:
     r = subprocess.run([sys.executable, os.path.join(KIT, s[0])], cwd=KIT, capture_output=True, text=True)
