@@ -8,8 +8,7 @@ It does not replace the method; it makes each step quick and enforces the rules.
 Needs: a Raspberry Pi 4 or 400 (V3D 4.2) running Linux with a Vulkan loader and the broadcom
 driver, `glslc` (shader compiler), Python 3 with numpy, and a C compiler with the Vulkan headers.
 
-1. Build the batch runner `tools/exec_big` (see `tools/build_exec_big.sh`). It is built from the oido
-   project's `exec.c`, which is not in this repo yet (see "Not included" in the license section).
+1. Build the batch runner: `sh tools/build_exec_big.sh` (builds `tools/exec_big` from `runner/exec.c`).
 2. Point the kit at a Vulkan driver in `gpuport/config.py` (`VK_ENV`). Use the patched driver from
    `patches/` for hang reporting.
 3. Run `python3 tests/check_runner.py` first. It fails if the runner or driver is broken.
@@ -117,5 +116,6 @@ variables in `gpuport/config.py`. The tests that need them say so when the files
 - The kit's own code and documentation: MIT (see `LICENSE`).
 - `patches/kernel/`: GPL-2.0+, because it changes `drivers/gpu/drm/v3d` (SPDX `GPL-2.0+`).
 - `patches/mesa/`: MIT, because it changes a Mesa file that is MIT-licensed.
-- Not included: the oido runner source (`exec.c`), the asr4all GPU shaders (no license file found
-  in that project), and the model weights (linked above).
+- `runner/exec.c` (the batch runner): MIT.
+- Not included: the asr4all GPU shaders (no license file found in that project), and the model
+  weights (linked above).
