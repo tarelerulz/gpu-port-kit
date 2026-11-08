@@ -22,7 +22,7 @@ Settings (environment variables):
 - `OIDO_GPU_SERVER`: the server binary itself (default: `OIDO_GPU_DIR/exec_server`).
 - `LD_LIBRARY_PATH`, `VK_ICD_FILENAMES`: the Vulkan loader and driver (see the quick start).
 
-Not included yet: the `exec_server` binary (the resident version of the batch runner). The weights are not included either.
+The resident server source is in `runner/exec_server2.c`; build it with `sh tools/build_exec_server.sh` (it creates `tools/exec_server_fixed`; point `OIDO_GPU_SERVER` at it). The weights are not included.
 Tested: `GpuEncoder2` gives the same logits as the original oido copy on the same 5-second clip (max difference 0).
 
 ## Map of the GPU
