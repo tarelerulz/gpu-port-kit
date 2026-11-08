@@ -14,6 +14,17 @@ driver, `glslc` (shader compiler), Python 3 with numpy, and a C compiler with th
 3. Run `python3 tests/check_runner.py` first. It fails if the runner or driver is broken.
 4. Run `python3 tests/run_all.py` for the full set. The nemo8 test needs the weights (see below).
 
+## Oido port scripts (`port/`)
+`port/gpu_encoder2.py` runs the nemo8 speech model on the Pi GPU (front end included). `port/nemo_ref.py` reads the model file.
+Settings (environment variables):
+- `OIDO_MODEL`: the nemo8 weights file (download from the Hugging Face link above).
+- `OIDO_GPU_DIR`: folder with the GPU server binary `exec_server` and its shaders.
+- `OIDO_GPU_SERVER`: the server binary itself (default: `OIDO_GPU_DIR/exec_server`).
+- `LD_LIBRARY_PATH`, `VK_ICD_FILENAMES`: the Vulkan loader and driver (see the quick start).
+
+Not included yet: the `exec_server` binary (the resident version of the batch runner). The weights are not included either.
+Tested: `GpuEncoder2` gives the same logits as the original oido copy on the same 5-second clip (max difference 0).
+
 ## Map of the GPU
 - `GPU_MAP.md`: how the device, plans, memory and layouts work, with measured speed and known gaps. Read this first.
 - `GPU_SHADERS.md`: generated catalog of every shader (local size, bindings, push words). Regenerate: `python3 tools/catalog_shaders.py`.
