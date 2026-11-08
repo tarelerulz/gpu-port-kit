@@ -1,0 +1,198 @@
+--- a/drivers/gpu/drm/v3d/v3d_sched.c
++++ b/drivers/gpu/drm/v3d/v3d_sched.c
+@@ -222,10 +222,29 @@
+ 		preempt_enable();
+ }
+ 
++/* Non-zero (a negative errno) if a job this one depends on failed. */
++static int v3d_dep_error(struct v3d_job *job)
++{
++	u32 i;
++
++	for (i = 0; i < job->dep_count; i++) {
++		int st = dma_fence_get_status(job->dep_fences[i]);
++
++		if (st < 0) {
++			return st;
++		}
++	}
++	return 0;
++}
++
+ static struct dma_fence *v3d_bin_job_run(struct drm_sched_job *sched_job)
+ {
+ 	struct v3d_bin_job *job = to_bin_job(sched_job);
+ 	struct v3d_dev *v3d = job->base.v3d;
++	int dep_err = v3d_dep_error(&job->base);
++
++	if (dep_err)
++		return ERR_PTR(dep_err);
+ 	struct v3d_queue_state *queue = &v3d->queue[V3D_BIN];
+ 	struct drm_device *dev = &v3d->drm;
+ 	struct dma_fence *fence;
+@@ -287,6 +306,10 @@
+ {
+ 	struct v3d_render_job *job = to_render_job(sched_job);
+ 	struct v3d_dev *v3d = job->base.v3d;
++	int dep_err = v3d_dep_error(&job->base);
++
++	if (dep_err)
++		return ERR_PTR(dep_err);
+ 	struct drm_device *dev = &v3d->drm;
+ 	struct dma_fence *fence;
+ 
+@@ -335,6 +358,10 @@
+ {
+ 	struct v3d_tfu_job *job = to_tfu_job(sched_job);
+ 	struct v3d_dev *v3d = job->base.v3d;
++	int dep_err = v3d_dep_error(&job->base);
++
++	if (dep_err)
++		return ERR_PTR(dep_err);
+ 	struct drm_device *dev = &v3d->drm;
+ 	struct dma_fence *fence;
+ 
+@@ -382,6 +409,10 @@
+ {
+ 	struct v3d_csd_job *job = to_csd_job(sched_job);
+ 	struct v3d_dev *v3d = job->base.v3d;
++	int dep_err = v3d_dep_error(&job->base);
++
++	if (dep_err)
++		return ERR_PTR(dep_err);
+ 	struct drm_device *dev = &v3d->drm;
+ 	struct dma_fence *fence;
+ 	int i, csd_cfg0_reg;
+@@ -710,6 +741,16 @@
+ 	struct v3d_job *job = to_v3d_job(sched_job);
+ 	struct v3d_dev *v3d = job->v3d;
+ 
++	/* The compute job we wait for was dropped as hung: fail this job too, so the
++	 * fence that userspace waits on carries the error (the scheduler sets it from ERR_PTR). */
++	if (job->dep_fence) {
++		int dep_status = dma_fence_get_status(job->dep_fence);
++
++		if (dep_status < 0) {
++			return ERR_PTR(dep_status);
++		}
++	}
++
+ 	v3d_job_start_stats(job, V3D_CACHE_CLEAN);
+ 
+ 	v3d_clean_caches(v3d);
+@@ -730,8 +771,15 @@
+ 	for (q = 0; q < V3D_MAX_QUEUES; q++)
+ 		drm_sched_stop(&v3d->queue[q].sched, sched_job);
+ 
+-	if (sched_job)
++	if (sched_job) {
+ 		drm_sched_increase_karma(sched_job);
++		/* A job that exceeds its hang limit is dropped as guilty and not resubmitted. Mark its
++		 * completion fence as failed, so userspace (Vulkan) sees an error instead of success
++		 * with garbage output. Setting the error is kept if the scheduler signals the fence later. */
++		if (sched_job->s_fence &&
++		    atomic_read(&sched_job->karma) > sched_job->sched->hang_limit)
++			dma_fence_set_error(&sched_job->s_fence->finished, -ETIMEDOUT);
++	}
+ 
+ 	/* get the GPU back into the init state */
+ 	v3d_reset(v3d);
+--- a/drivers/gpu/drm/v3d/v3d_submit.c
++++ b/drivers/gpu/drm/v3d/v3d_submit.c
+@@ -132,6 +132,12 @@
+ 	struct v3d_dev *v3d = job->v3d;
+ 	int i;
+ 
++	for (i = 0; i < job->dep_count; i++)
++		dma_fence_put(job->dep_fences[i]);
++	kfree(job->dep_fences);
++	job->dep_fences = NULL;
++	job->dep_count = job->dep_max = 0;
++
+ 	if (job->bo) {
+ 		for (i = 0; i < job->bo_count; i++)
+ 			drm_gem_object_put(job->bo[i]);
+@@ -140,6 +146,7 @@
+ 
+ 	dma_fence_put(job->irq_fence);
+ 	dma_fence_put(job->done_fence);
++	dma_fence_put(job->dep_fence);
+ 
+ 	if (is_gpu_job)
+ 		v3d_clock_up_put(v3d);
+@@ -216,6 +223,17 @@
+ 	*container = NULL;
+ }
+ 
++static void
++v3d_job_record_dep(struct v3d_job *job, struct drm_file *file_priv, u32 handle)
++{
++	struct dma_fence *fence = NULL;
++
++	if (!job->dep_fences || job->dep_count >= job->dep_max)
++		return;
++	if (drm_syncobj_find_fence(file_priv, handle, 0, 0, &fence) == 0 && fence)
++		job->dep_fences[job->dep_count++] = fence;
++}
++
+ static int
+ v3d_job_init(struct v3d_dev *v3d, struct drm_file *file_priv,
+ 	     struct v3d_job *job, void (*free)(struct kref *ref),
+@@ -234,6 +252,15 @@
+ 	if (ret)
+ 		return ret;
+ 
++	job->dep_max = has_multisync ? (se ? se->in_sync_count : 0) : 1;
++	if (job->dep_max) {
++		job->dep_fences = kcalloc(job->dep_max, sizeof(*job->dep_fences), GFP_KERNEL);
++		if (!job->dep_fences) {
++			drm_sched_job_cleanup(&job->base);
++			return -ENOMEM;
++		}
++	}
++
+ 	if (has_multisync) {
+ 		if (se->in_sync_count && se->wait_stage == queue) {
+ 			struct drm_v3d_sem __user *handle = u64_to_user_ptr(se->in_syncs);
+@@ -247,6 +274,7 @@
+ 					goto fail_deps;
+ 				}
+ 				ret = drm_sched_job_add_syncobj_dependency(&job->base, file_priv, in.handle, 0);
++				v3d_job_record_dep(job, file_priv, in.handle);
+ 
+ 				// TODO: Investigate why this was filtered out for the IOCTL.
+ 				if (ret && ret != -ENOENT)
+@@ -255,6 +283,7 @@
+ 		}
+ 	} else {
+ 		ret = drm_sched_job_add_syncobj_dependency(&job->base, file_priv, in_sync, 0);
++		v3d_job_record_dep(job, file_priv, in_sync);
+ 
+ 		// TODO: Investigate why this was filtered out for the IOCTL.
+ 		if (ret && ret != -ENOENT)
+@@ -1281,6 +1310,7 @@
+ 	mutex_lock(&v3d->sched_lock);
+ 	v3d_push_job(&job->base);
+ 
++	clean_job->dep_fence = dma_fence_get(job->base.done_fence);
+ 	ret = drm_sched_job_add_dependency(&clean_job->base,
+ 					   dma_fence_get(job->base.done_fence));
+ 	if (ret)
+--- a/drivers/gpu/drm/v3d/v3d_drv.h
++++ b/drivers/gpu/drm/v3d/v3d_drv.h
+@@ -312,6 +312,15 @@
+ 	 */
+ 	struct dma_fence *done_fence;
+ 
++	/* Cache-clean jobs: the compute job they wait for. If that job failed, so does the clean job
++	 * (the syncobj that userspace waits on is attached to the clean job). */
++	struct dma_fence *dep_fence;
++
++	/* Fences of the in-syncs taken at submit. drm_sched does not propagate a dependency error to a
++	 * job that depends on it, so the job checks these in its run function. */
++	struct dma_fence **dep_fences;
++	u32 dep_count, dep_max;
++
+ 	/* Pointer to a performance monitor object if the user requested it,
+ 	 * NULL otherwise.
+ 	 */

@@ -1,0 +1,52 @@
+--- a/src/vulkan/runtime/vk_drm_syncobj.c
++++ b/src/vulkan/runtime/vk_drm_syncobj.c
+@@ -278,6 +278,27 @@
+    return VK_SUCCESS;
+ }
+ 
++/* A syncobj wait returns success even when the fence finished with an error (the kernel reports
++ * the error only through the fence's status). Check it through a sync file, so a failed GPU job
++ * (for example after a v3d GPU reset) is reported as VK_ERROR_DEVICE_LOST. */
++static VkResult
++vk_drm_syncobj_check_fence_error(struct vk_device *device, uint32_t handle)
++{
++   int fd = -1;
++   if (device->sync->export_sync_file(device->sync, handle, &fd) != 0)
++      return VK_SUCCESS;
++   struct sync_file_info *info = sync_file_info(fd);
++   close(fd);
++   if (!info)
++      return VK_SUCCESS;
++   int status = info->status;
++   free(info);
++   if (status < 0)
++      return vk_errorf(device, VK_ERROR_DEVICE_LOST,
++                       "GPU job failed (fence status %d)", status);
++   return VK_SUCCESS;
++}
++
+ static VkResult
+ vk_drm_syncobj_wait_many(struct vk_device *device,
+                          uint32_t wait_count,
+@@ -350,6 +371,12 @@
+                                NULL /* first_signaled */);
+    }
+ 
++   VkResult fence_result = VK_SUCCESS;
++   if (err == 0 && !has_timeline && !(wait_flags & VK_SYNC_WAIT_PENDING)) {
++      for (uint32_t j = 0; j < wait_count && fence_result == VK_SUCCESS; j++)
++         fence_result = vk_drm_syncobj_check_fence_error(device, handles[j]);
++   }
++
+    STACK_ARRAY_FINISH(handles);
+    STACK_ARRAY_FINISH(wait_values);
+ 
+@@ -360,7 +387,7 @@
+                        "DRM_IOCTL_SYNCOBJ_WAIT failed: %m");
+    }
+ 
+-   return VK_SUCCESS;
++   return fence_result;
+ }
+ 
+ static VkResult
