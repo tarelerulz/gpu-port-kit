@@ -8,7 +8,7 @@
 //   OV4 1 only: 14 mode (0 none, 1 v + R) | 16 out2 (0xffffffff = none,
 //   out strides) = v * S[n] + T[n] (a BatchNorm of the result, also kept) | 17 S, 18 T, 19 sSn, 20 sTn
 layout(local_size_x = 256) in;
-#include "/home/tarel/src/asr4all-gpu/shaders/common.glsl"
+#include "common.glsl"   // compile with -I <asr-gpu>/shaders (see README)
 #include "specialization.glsl"
 #define LDA(base, idx) a[int(base) + (idx)]
 #define ACC(j, wv, c) s##j += wv.c * x;

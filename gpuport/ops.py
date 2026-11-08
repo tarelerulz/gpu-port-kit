@@ -1,10 +1,10 @@
-"""Push-constant layouts for shaders already used in the oido ports (~/oido/port/gpu_encoder2.py and
-~/src/asr4all-gpu/shaders). Add a helper here each time a new shader is verified.
+"""Push-constant layouts for shaders already used in the speech-app ports (~/speech-app/port/gpu_encoder2.py and
+~/src/asr-gpu/shaders). Add a helper here each time a new shader is verified.
 
 Verification status:
   add    numpy-tested in selftest.py
   silu   numpy-tested in selftest.py
-  gemm12 numpy-tested in selftest.py (epi 0 and 2); asr4all + oido use it
+  gemm12 numpy-tested in selftest.py (epi 0 and 2); asr-gpu + speech-app use it
   ln, glu  push layout copied from gpu_encoder2.py; NOT separately tested here
 """
 from .plan import Plan, split_groups
@@ -58,7 +58,7 @@ def glu(plan, T, d, in_off, out_off):
 
 
 def gemm4(plan, a_off, M, mm, out_off, K=None, N=None, sAm=None, epi=0):
-    """gemm4 (oido gpu/gemm4.comp): 4 outputs x 4 rows per thread, weights [K][NP] with NP = roundup(N,4).
+    """gemm4 (speech-app gpu/gemm4.comp): 4 outputs x 4 rows per thread, weights [K][NP] with NP = roundup(N,4).
     Build the weights with Weights.put_mm(W, b, pad=4). Output scalar stores, out row stride N."""
     N = mm['n'] if N is None else N
     K = mm['k'] if K is None else K
@@ -72,7 +72,7 @@ def gemm4(plan, a_off, M, mm, out_off, K=None, N=None, sAm=None, epi=0):
 
 
 def gemm_k5(plan, a_off, M, mm4, out_off, K=None, N=None, sAm=None, epi=0):
-    """gemm_k5 (oido stream/gemm_k5.comp): one workgroup per (4 outputs, 4 rows), 64 threads split K, shared-memory
+    """gemm_k5 (speech-app stream/gemm_k5.comp): one workgroup per (4 outputs, 4 rows), 64 threads split K, shared-memory
     reduction. Weights from Weights.put_mm4(). Needs the stream shader folder in the merged shader dir."""
     N = mm4['n'] if N is None else N
     K = mm4['k'] if K is None else K

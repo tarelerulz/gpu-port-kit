@@ -1,6 +1,6 @@
 """Self-test on the real GPU. Each check is numpy vs GPU for one op, then a small plan with bisect.
-usage: python3 ~/gpu-port-kit/selftest.py [--timing] [--oido]
---oido also lints the real nemo8 plan built by ~/oido/port/gpu_encoder2.py (if present)."""
+usage: python3 ~/gpu-port-kit/selftest.py [--timing] [--speech-app]
+--speech-app also lints the real nemo8 plan built by ~/speech-app/port/gpu_encoder2.py (if present)."""
 import os
 import sys
 import numpy as np
@@ -88,11 +88,11 @@ if __name__ == '__main__':
     test_bisect_and_lint()
     if '--timing' in sys.argv:
         test_timing()
-    if '--oido' in sys.argv:
-        sys.path.insert(0, os.path.expanduser('~/oido/port'))
+    if '--speech-app' in sys.argv:
+        sys.path.insert(0, os.path.expanduser('~/speech-app/port'))
         import json
         import gpu_encoder2 as g
-        L = json.load(open(os.path.expanduser('~/oido/port/cache2/layout.json')))
+        L = json.load(open(os.path.expanduser('~/speech-app/port/cache2/layout.json')))
         ops_, size, R, Tm, T = g.build(16000, L)
         p = Plan([])
         for name, local, gx, gy, push in ops_:

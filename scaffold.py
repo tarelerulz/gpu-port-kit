@@ -52,7 +52,7 @@ if __name__ == '__main__':
     # add one test per new op type here; add the shader's own .comp/.spv to the shader dir first
 ''',
 'build_plan.py': '''"""{name}: plan builder (steps 4-5). Regions and weights come from the kit; check with the linter:
-  python3 ~/gpu-port-kit/gpuport/plan.py work/{name}.plan ~/oido/port/gpu   (or your shader dir)"""
+  python3 ~/gpu-port-kit/gpuport/plan.py work/{name}.plan ~/speech-app/port/gpu   (or your shader dir)"""
 import os, sys
 sys.path.insert(0, os.path.expanduser('~/gpu-port-kit'))
 from gpuport import Arena, Weights, Plan, ops, check
@@ -73,7 +73,7 @@ if __name__ == '__main__':
 ''',
 'NOTES.md': '''# {name} GPU port: log
 
-Started {today}. Method: ~/doc/agent-memory/gpu-porting-guide.md and the kit at ~/gpu-port-kit (README).
+Started {today}. Method: <notes>/gpu-porting-guide.md and the kit at ~/gpu-port-kit (README).
 
 ## Status
 - [ ] 1 numpy reference matches CPU (2 clips, tokens identical)

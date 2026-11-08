@@ -1,4 +1,4 @@
-"""Resident GPU server: oido's gpu/exec_server2 (24M-float arena and 48M-float weights, loaded once).
+"""Resident GPU server: speech-app's gpu/exec_server2 (24M-float arena and 48M-float weights, loaded once).
 Each request sends a plan file and an arena file; the server runs it and writes the requested output region.
 Avoids the per-run process start, Vulkan setup and weight-file load that the one-shot exec pays."""
 import os
