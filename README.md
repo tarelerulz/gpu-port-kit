@@ -117,5 +117,5 @@ variables in `gpuport/config.py`. The tests that need them say so when the files
 - `patches/kernel/`: GPL-2.0+, because it changes `drivers/gpu/drm/v3d` (SPDX `GPL-2.0+`).
 - `patches/mesa/`: MIT, because it changes a Mesa file that is MIT-licensed.
 - `runner/exec.c` (the batch runner): MIT.
-- Not included: the asr4all GPU shaders (no license file found in that project), and the model
-  weights (linked above).
+- `shaders/common.glsl`, `shaders/specialization.glsl`, `shaders/gemm12.comp`: MIT (see `shaders/LICENSE-shaders`).
+- Not included: the model weights (linked above).
