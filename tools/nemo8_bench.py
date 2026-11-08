@@ -1,5 +1,5 @@
-"""nemo8 speed proof: GPU path (kit plan, optimized front end) vs the host CPU encoder, on tarel40 (10 s) and
-speak (5 s). For each: wall time, GPU submit+wait, CPU seconds used by the process, and whether the transcript
+"""nemo8 speed proof: GPU path (kit plan, optimized front end) vs the host CPU encoder, on clip10s (10 s) and
+clip5s (5 s). For each: wall time, GPU submit+wait, CPU seconds used by the process, and whether the transcript
 matches the CPU transcript. Writes GPU_NEMO8_BENCH.md.
 usage: python3 tools/nemo8_bench.py [repeats]"""
 import os
@@ -15,8 +15,8 @@ import nemo8_rebuild as nb
 from gpuport.server import ExecServer
 from gpuport.config import WORK_DIR, merged_shader_dir
 
-CPU = os.path.expanduser('~/oido/host/tasr_cli_a72')
-MODEL = os.path.expanduser('~/oido/models/nemo8.tnm')
+CPU = os.path.expanduser('~/speech-app/host/tasr_cli_a72')
+MODEL = os.path.expanduser('~/speech-app/models/nemo8.tnm')
 REPEATS = int(sys.argv[1]) if len(sys.argv) > 1 else 3
 
 
@@ -44,8 +44,8 @@ def proc_cpu(pid):
 srv = ExecServer(wpath, nb.SHADERS).start()
 srv.run(nb.build(16000, L, optimized=True)[0], np.zeros(16000, np.float32), 0, 1)   # warm-up: pipelines, buffers
 rows = []
-for clip in ['tarel40', 'speak']:
-    pcm = np.fromfile(os.path.join(nb.OIDO, clip + '.pcm'), '<i2')
+for clip in ['clip10s', 'clip5s']:
+    pcm = np.fromfile(os.path.join(nb.SPEECH_APP, clip + '.pcm'), '<i2')
     audio_s = len(pcm) / 16000
     plan, ar, R, T = nb.build(len(pcm), L, optimized=True)
     arena_in = pcm.astype(np.float32) / 32768.0
@@ -60,7 +60,9 @@ for clip in ['tarel40', 'speak']:
     c_wall, c_cpu, text_c = [], [], ''
     for _ in range(REPEATS):
         r0 = resource.getrusage(resource.RUSAGE_CHILDREN); t0 = time.time()
-        res = subprocess.run([CPU, MODEL, wav], capture_output=True, text=True)   # greedy, no LM: same decoder as GPU
+        # 3 threads on cores 0-2: leave one core free so the Pi does not freeze (2026-11-05 freeze with 4 threads)
+        res = subprocess.run(['taskset', '-c', '0,1,2', CPU, MODEL, wav], capture_output=True, text=True,
+                             env={**os.environ, 'TASR_THREADS': '3', 'OMP_NUM_THREADS': '3'})   # greedy, no LM: same decoder as GPU
         c_wall.append(time.time() - t0)
         c_cpu.append(cpu_s(resource.getrusage(resource.RUSAGE_CHILDREN)) - cpu_s(r0))
         text_c = res.stdout.strip().split('\t')[-1] if res.stdout.strip() else res.stderr.strip()

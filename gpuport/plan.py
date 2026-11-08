@@ -108,7 +108,7 @@ def check_arena_limit(used_floats):
 if __name__ == '__main__':
     import sys
     plan_path = sys.argv[1]
-    sdir = sys.argv[2] if len(sys.argv) > 2 else os.path.expanduser('~/oido/port/gpu')
+    sdir = sys.argv[2] if len(sys.argv) > 2 else os.path.expanduser('~/speech-app/port/gpu')
     p = Plan.load(plan_path)
     msgs = p.lint(sdir)
     for lvl, m in msgs:

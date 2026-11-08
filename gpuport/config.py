@@ -2,8 +2,8 @@
 import os
 
 # Directory holding exec.c's binary and the *.spv shaders (exec loads <name>.spv from its cwd).
-SHADER_DIR = os.environ.get('GPUPORT_SHADERS', os.path.expanduser('~/oido/port/gpu'))
-# Default runner: the kit's fixed build (tools/build_exec_big.sh); oido's exec has the specialization-constant bug.
+SHADER_DIR = os.environ.get('GPUPORT_SHADERS', os.path.expanduser('~/speech-app/port/gpu'))
+# Default runner: the kit's fixed build (tools/build_exec_big.sh); speech-app's exec has the specialization-constant bug.
 EXEC_BIN = os.environ.get('GPUPORT_EXEC', os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'tools', 'exec_big'))
 # Scratch files (arena/plan/out). Not in /tmp on purpose.
 WORK_DIR = os.environ.get('GPUPORT_WORK', os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'work'))
@@ -15,7 +15,7 @@ VK_ENV = {
 # exec.c fixed buffer sizes (floats). Plans must stay inside them.
 EXEC_ARENA_FLOATS = 8 << 20
 EXEC_WEIGHT_FLOATS = 32 << 20
-# Rules measured on this Pi (see ~/doc/agent-memory/2026-11-03-gpu-porting-rules.md).
+# Rules measured on this Pi (see <notes>/2026-11-03-gpu-porting-rules.md).
 REGION_GAP = 131072       # floats after every arena region
 ALIGN = 64                # floats, arena region start
 MIN_WORKGROUPS = 24       # fewer gave wrong gemm12 output at some shapes
@@ -26,11 +26,11 @@ GEMM12_MAX_ROWS = 251     # speed choice, not a correctness limit (2026-11-05): 
 
 KIT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 KIT_SHADERS = os.path.join(KIT_ROOT, 'shaders')
-STREAM_SHADERS = os.path.expanduser('~/oido/port/stream')   # gemm_k5 and other streaming shaders
+STREAM_SHADERS = os.path.expanduser('~/speech-app/port/stream')   # gemm_k5 and other streaming shaders
 
 
 def merged_shader_dir(extra=(KIT_SHADERS,), base=None):
-    """Folder with symlinks to the oido shaders plus the kit's own shaders (kit wins on a name clash).
+    """Folder with symlinks to the speech-app shaders plus the kit's own shaders (kit wins on a name clash).
     exec loads <name>.spv from its cwd, so plans that use both need this folder."""
     import glob
     out = os.path.join(WORK_DIR, 'shaders')

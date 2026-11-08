@@ -26,7 +26,7 @@ def run(plan, arena_init, out_off, out_n, weights=None, shader_dir=None, exec_bi
     if isinstance(plan, (list, tuple)):
         plan = Plan(plan)
     if shader_dir is None:
-        shader_dir = merged_shader_dir()   # oido shaders + kit shaders (kit wins), as nemo8 uses
+        shader_dir = merged_shader_dir()   # speech-app shaders + kit shaders (kit wins), as nemo8 uses
     if lint:
         errs = [m for lvl, m in plan.lint(shader_dir) if lvl == 'error']
         if errs:

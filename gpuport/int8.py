@@ -6,7 +6,7 @@ from .arena import roundup
 
 
 def read_q8(Bl, n, k):
-    """Read one 8-bit linear from an oido blob (same layout as nemo_ref.Blob.qlin, bits=8).
+    """Read one 8-bit linear from an speech-app blob (same layout as nemo_ref.Blob.qlin, bits=8).
     Returns (q int8 [n][k], scale f32 [n], bias f32 [n])."""
     Bl.align()
     kp = (k + 15) // 16 * 16

@@ -31,7 +31,7 @@ class Weights:
         return dict(wo=self.put(Wt), bo=self.put(bp), n=n, k=k, np=NP)
 
     def put_mm4(self, Wm, bias=None):
-        """Weights for gemm_k5 (oido stream/gemm_k5.comp): vec4 per (output group cg, k) holding outputs cg*4..cg*4+3.
+        """Weights for gemm_k5 (speech-app stream/gemm_k5.comp): vec4 per (output group cg, k) holding outputs cg*4..cg*4+3.
         Stored as [NP/4][K][4]. Bias padded to NP (float). Returns dict(wo4, bo, n, k, np)."""
         Wm = np.asarray(Wm, np.float32)
         n, k = Wm.shape

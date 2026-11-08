@@ -1,5 +1,5 @@
 """Relative-position attention on the GPU, checked against numpy (the math from
-~/oido/port/nemo_ref.py forward, one conformer layer). Chain:
+~/speech-app/port/nemo_ref.py forward, one conformer layer). Chain:
   pe_gen (sin/cos table, 2T-1 rows)  ->  gemm12 pos projection (P = PE @ Wpos^T + b)
   ->  att_scores5 (S = scale*(qu.k + qv.P[T-1-i+j]))  ->  att_softmax (in place)  ->  att_pv6 (out = S @ V)
 qkv rows are [q(d) | k(d) | v(d)]; head h uses columns h*dh..(h+1)*dh of each third.
