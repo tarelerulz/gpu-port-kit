@@ -6,6 +6,7 @@ import tempfile
 import numpy as np
 from .config import EXEC_BIN, WORK_DIR, VK_ENV, EXEC_ARENA_FLOATS, merged_shader_dir
 from .plan import Plan
+from .gpu_health import last_reset_marker, check_no_reset
 
 _SUBMIT = re.compile(r'gpu submit\+wait ([0-9.]+) ms')
 _seq = [0]
@@ -43,10 +44,12 @@ def run(plan, arena_init, out_off, out_n, weights=None, shader_dir=None, exec_bi
     env = dict(os.environ, **VK_ENV)
     if prof:
         env['EXEC_PROF'] = prof          # exec_prof writes one line per dispatch
+    marker = last_reset_marker()
     r = subprocess.run([exec_bin, base + '.plan', base + '.arena_in', wpath, base + '.arena_out',
                         str(out_off), str(out_n)], env=env, cwd=shader_dir, capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError(f'exec failed ({r.returncode}): {r.stderr.strip()}')
+    check_no_reset(marker)                  # a GPU reset makes the output garbage (Vulkan reports success)
     m = _SUBMIT.search(r.stderr)
     ms = float(m.group(1)) if m else float('nan')
     out = np.fromfile(base + '.arena_out', '<f4')
