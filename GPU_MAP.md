@@ -1,7 +1,7 @@
 # How the Pi 400 GPU works, for porting models
 
 Written 2026-11-04 from the kit's tests and benchmarks. **(T)** = run and checked in this session.
-**(N)** = from the earlier oido/asr4all notes (~/doc/agent-memory/2026-11-03-gpu-porting-rules.md etc.), not re-run here.
+**(N)** = from the earlier speech-app/asr-gpu notes (<notes>/2026-11-03-gpu-porting-rules.md etc.), not re-run here.
 Companion files: GPU_SHADERS.md (generated shader catalog), GPU_TIMINGS_T251.md (generated timings).
 
 ## 1. Device (T: tools/devinfo.c)
@@ -28,7 +28,7 @@ Companion files: GPU_SHADERS.md (generated shader catalog), GPU_TIMINGS_T251.md 
 ## 3. Memory rules
 - Arena regions start on 64-float boundaries and are followed by a 131072-float gap (T in Arena; N: a matmul output placed just
   below its input read back wrong).
-- vec4 views need offsets divisible by 4. All row strides in the oido port are multiples of 4 (N).
+- vec4 views need offsets divisible by 4. All row strides in the speech-app port are multiples of 4 (N).
 - Weight offsets are 16-float aligned (T: Weights.put).
 - In-place is fine for: softmax (T), silu (shader comment), LayerNorm X -> X (N, used at the end of the encoder).
 - Use signed ints for offsets that can go negative (positional index T-1-i+j). Unsigned wrap gave wrong positions (N).
@@ -43,7 +43,7 @@ Companion files: GPU_SHADERS.md (generated shader catalog), GPU_TIMINGS_T251.md 
 |---|---|---|---|---|
 | gemm12 (matmul + epilogue) | A row-major [M][K], row stride sAm | `put_mm`: W^T as [K][NP], NP = roundup(N,12), zero padding; bias [NP] | [M][N] | selftest; layouts test (M=37, 300 split into 2 blocks) |
 | gemm12 epilogue codes | | | | 0 none, 1 hardswish, 2 silu, 3 relu, 4 sigmoid (common.glsl) |
-| 8-bit weights (oido format) | int8 rows of kp = roundup(K,16) | the reader gives W = q * scale[row]; the GPU gets W in f32 via put_mm | | layouts test: reader exact, GPU max diff 1.1e-5 |
+| 8-bit weights (speech-app format) | int8 rows of kp = roundup(K,16) | the reader gives W = q * scale[row]; the GPU gets W in f32 via put_mm | | layouts test: reader exact, GPU max diff 1.1e-5 |
 | add | a[dst+i] += scale*a[src+i]; scale as float bits in push | none | in place | selftest |
 | silu | in -> out | none | | selftest (2.4e-7) |
 | ln | rows [T][d] | gamma at O, beta at O+d (one put of concat) | [T][d], eps 1e-5 | layouts test (4.8e-7) |
@@ -86,7 +86,7 @@ other than the ones above, and gemm4 / gemm12u.
 
 ## 7. Full-model check
 - tests/nemo8_rebuild.py rebuilds nemo8 with kit helpers. Weights are byte-identical to the production cache; logits are
-  identical to the production GPU encoder on tarel40 and speak; tokens match the C reference on both. Needs tools/exec_big
+  identical to the production GPU encoder on clip10s and clip5s; tokens match the C reference on both. Needs tools/exec_big
   (built from exec.c with a 24M-float arena: `sed` the two defines and compile with -lvulkan).
 
 ## 8. How to design a model for this GPU
@@ -97,8 +97,8 @@ other than the ones above, and gemm4 / gemm12u.
 5. Log each round in a dated note.
 
 ## 9. Known gaps and warnings
-- Shaders in ~/src/asr4all-gpu/shaders: `ew` and `gemm12` have .spv older than .comp (stale flag in GPU_SHADERS.md). The oido
-  gemm12 in ~/oido/port/gpu is not flagged. The asr4all gemm12.comp needs `-I ~/src/asr4all-gpu/shaders` (specialization.glsl).
+- Shaders in ~/src/asr-gpu/shaders: `ew` and `gemm12` have .spv older than .comp (stale flag in GPU_SHADERS.md). The speech-app
+  gemm12 in ~/speech-app/port/gpu is not flagged. The asr-gpu gemm12.comp needs `-I ~/src/asr-gpu/shaders` (specialization.glsl).
 - The 65535-group split path is untested. The streaming and front-end layouts are only checked end to end (N).
 - att_scores5's header comment says "11 vec4 chunks", but the code loops over dh/4 (44/4 = 11 here), so it is general.
 - Arena need for the nemo8 full-GPU plan (computed from gpu_encoder2.build): 1 s = 4.37M floats, 2 s = 5.95M, 5 s = 10.7M, 10 s = 18.7M.
@@ -108,7 +108,7 @@ other than the ones above, and gemm4 / gemm12u.
 - **Power-of-two row stride is a 7x penalty for gemm12 (T).** A DFT input with row stride 512 ran at 115 ms per 251-row block
   (0.29 GMAC/s); the same data with stride 513, 516, 520, 528 or 544 ran at 16-17 ms (1.9-2.0 GMAC/s). Pad activation rows
   to a non-power-of-two stride before a matmul reads them (tools/bench_gemm.py, the stride test in the notes).
-- **gemm4 (oido gpu/gemm4.comp) is slower than gemm12 at all four nemo8 shapes (T, tools/bench_gemm.py):**
+- **gemm4 (speech-app gpu/gemm4.comp) is slower than gemm12 at all four nemo8 shapes (T, tools/bench_gemm.py):**
   0.09-1.05 GMAC/s against 1.9-2.0. Keep gemm12.
 - **Per-thread-per-output front-end shaders are slow (T).** fe_conv0 (one thread per output, 9 taps with re-reads) took 434 ms;
   the rewritten version (one thread per (t2, f) producing all 176 channels, same arithmetic order) takes 70 ms, bit-identical.
@@ -137,13 +137,13 @@ attention score kernel.
 Matmul kernels at the nemo8 shapes, one 251-row block (tools/bench_gemm.py, GPU_GEMM_BENCH.md):
 | kernel | DFT (K=512, stride 512) | conv2 (K=1584) | subsample (K=3520) | FF1 (K=176, N=704) | verdict |
 |---|---|---|---|---|---|
-| gemm12 (oido) | 115 ms | 36 ms | 80 ms | 16 ms | keep |
+| gemm12 (speech-app) | 115 ms | 36 ms | 80 ms | 16 ms | keep |
 | gemm4 | 387 ms | 66 ms | 152 ms | 30 ms | REJECTED |
 | gemm_k5 (stream) | 92 ms | 103 ms | 174 ms | 204 ms | REJECTED |
 | gemm12v (kit, vec4 A along K) | 112 ms | 147 ms | 322 ms | 70 ms | REJECTED (4x slower at the tile, cause not isolated) |
 The DFT row uses stride 512; with a padded stride gemm12 gives 16-17 ms (section 10).
 
-Run path: the resident server (gpuport/server.py over oido's exec_server2) runs nemo8 in 3.93 s wall for the 10 s clip,
+Run path: the resident server (gpuport/server.py over speech-app's exec_server2) runs nemo8 in 3.93 s wall for the 10 s clip,
 kernel time 3.91 s, and the server process uses 0.03 CPU-s per run (the one-shot exec used 0.68 CPU-s, mostly setup).
 A correction to section 11: the GPU CPU cost is 0.03 s with the resident server, not 0.68 s.
 
@@ -151,11 +151,11 @@ Still open: layers (2.7 s) need a faster matmul core; attention scores (0.6 s) n
 is inherent 1.4 GMAC; a real FFT would save about 0.1 s on the DFT part.
 
 ## 13. Dictation menu (2026-11-05)
-- prefix+v > "Oido full GPU (front end too, kit: ~2 s per phrase)" now runs gpuport.nemo8.Nemo8Encoder (resident exec_server2)
-  through oido-type.py --gpu-full. The old gpu_encoder2.py is no longer used by the menu; its file is kept.
-- Rollback: cp ~/voice-chat/live-mic-stream/oido-type.py.bak-2026-11-05-gpufull-old ~/voice-chat/live-mic-stream/oido-type.py;
+- prefix+v > "SpeechApp full GPU (front end too, kit: ~2 s per phrase)" now runs gpuport.nemo8.Nemo8Encoder (resident exec_server2)
+  through speech-app-type.py --gpu-full. The old gpu_encoder2.py is no longer used by the menu; its file is kept.
+- Rollback: cp <app>/speech-app-type.py.bak-2026-11-05-gpufull-old <app>/speech-app-type.py;
   cp ~/.tmux-voice-menu.conf.bak-2026-11-05 ~/.tmux-voice-menu.conf; then reload tmux (source-file ~/.tmux.conf).
-- Same text as the old engine on speak, tarel40 and a 2 s slice (checked through OidoCLI.transcribe).
+- Same text as the old engine on clip5s, clip10s and a 2 s slice (checked through SpeechAppCLI.transcribe).
 - Latency floor (MEASURED): gemm12 takes about 16 ms per matmul dispatch whether M is 51 or 251 (latency-bound per dispatch).
   The encoder has about 400 dispatches, so a 2 s phrase takes about 2.0 s, and a 10 s clip 3.9 s. The CPU path answers a short
   phrase in about 0.1 s. The menu option is for freeing the CPU, not for responsiveness.
@@ -182,27 +182,27 @@ is inherent 1.4 GMAC; a real FFT would save about 0.1 s on the DFT part.
 - nemo8 with int8 linear layers (encoder linears and head): activations quantized per row (shaders/quant_rows.comp),
   packed int8 matmul with one scale per output row (shaders/gemm_i8.comp, gpuport/int8.py). Front end and attention stay float32.
 - One layer vs numpy with the same quantization: relative error 7e-8 (exact integer math).
-- Whole model: transcripts identical to the C reference on speak and tarel40. Argmax agreement with float32 99.2%.
+- Whole model: transcripts identical to the C reference on clip5s and clip10s. Argmax agreement with float32 99.2%.
 - Weight blob: 18.0 MB int8 vs 54.5 MB float32.
-- Speed: speak (5 s) 1849 ms vs 2562 ms float32 (single run each, not a median); tarel40 (10 s) 3905 ms vs 3924 ms: no gain.
-- Profile (tarel40): gemm_i8 1550 ms over 145 dispatches (10.7 ms each), gemm12 934 ms (front end and pos), attention scores 595 ms,
+- Speed: clip5s (5 s) 1849 ms vs 2562 ms float32 (single run each, not a median); clip10s (10 s) 3905 ms vs 3924 ms: no gain.
+- Profile (clip10s): gemm_i8 1550 ms over 145 dispatches (10.7 ms each), gemm12 934 ms (front end and pos), attention scores 595 ms,
   quantize 103 ms. Int8 matmul is only about 10% faster than float32 in this tile, so the model does not get faster.
 - Not wired into the menu. The float32 encoder remains the menu engine.
 
 ## 16. Root cause of the "251-row limit" (found 2026-11-05)
 - The old rule "gemm12 is only correct up to 251 rows" was WRONG. It was a runner bug.
-- exec (oido gpu/exec.c and exec_server2.c) sets specialization constant 0 to the workgroup size (256). The shared header
-  (asr4all shaders/specialization.glsl) reads U(0) = M from that constant. So every gemm12 call saw M = 256.
+- exec (speech-app gpu/exec.c and exec_server2.c) sets specialization constant 0 to the workgroup size (256). The shared header
+  (asr-gpu shaders/specialization.glsl) reads U(0) = M from that constant. So every gemm12 call saw M = 256.
   Rows 256+ were never written, and rows 251-255 were written past the end of the output.
 - Proof: with the constant left unset (tools/exec_nospec, same kernel), gemm12 is correct at M = 251, 260, 502 and 1001
   (max error 1.8e-7). Before the fix, rows 256 and up were wrong (bad rows exactly 256..M-1).
 - Fix: tools/build_exec_big.sh, tools/build_exec_prof.py and tools/build_exec_server.sh set the constant to 0xffffffff.
   The kit uses these builds by default (GPUPORT_EXEC defaults to tools/exec_big; the server wrapper uses tools/exec_server_fixed).
-- Outputs did not change: nemo8 argmax vs the C reference is the same with the old and fixed runners (100% speak, 98.8% tarel40).
+- Outputs did not change: nemo8 argmax vs the C reference is the same with the old and fixed runners (100% clip5s, 98.8% clip10s).
 - Speed: block size is still 251 rows, because time per call rises sharply above that: conv2 as one 5020-row call took 2.6 s.
-  Full nemo8 with the fixed runner: tarel40 3.89 s (kernel 3.88 s), speak 1.69 s (was 2.55 s with the bug). Server CPU 0.03 s.
-- oido's own runners are now fixed too (2026-11-05): ~/oido/port/gpu/exec, exec_server, exec_server2, exec_server_small.
-  Originals backed up in ~/oido/port/gpu/bak-2026-11-05-exec-fix/. The production encoder (gpu_encoder2) gives the same
+  Full nemo8 with the fixed runner: clip10s 3.89 s (kernel 3.88 s), clip5s 1.69 s (was 2.55 s with the bug). Server CPU 0.03 s.
+- speech-app's own runners are now fixed too (2026-11-05): ~/speech-app/port/gpu/exec, exec_server, exec_server2, exec_server_small.
+  Originals backed up in ~/speech-app/port/gpu/bak-2026-11-05-exec-fix/. The production encoder (gpu_encoder2) gives the same
   transcripts and the kit rebuild check still matches it exactly.
 
 ## 17. Cost of one step (measured 2026-11-05; corrects section 13)

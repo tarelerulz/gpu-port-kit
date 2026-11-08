@@ -1,8 +1,8 @@
 """Rebuild the nemo8 full-GPU encoder with the kit's helpers only (Weights, Arena, Plan, ops), then check it:
-  1. weight blob: byte-identical to the production cache (~/oido/port/cache2/weights.bin)
-  2. logits on tarel40 (10 s) and speak (5 s) vs the C reference (~/oido/port/*_logits.bin)
+  1. weight blob: byte-identical to the production cache (~/speech-app/port/cache2/weights.bin)
+  2. logits on clip10s (10 s) and clip5s (5 s) vs the C reference (~/speech-app/port/*_logits.bin)
   3. collapsed token text vs the same reference
-  4. logits vs the production GPU encoder (~/oido/port/gpu_encoder2.py): must be identical
+  4. logits vs the production GPU encoder (~/speech-app/port/gpu_encoder2.py): must be identical
 The C reference is int8; the float GPU path agrees with it on ~98.8% of argmax frames (earlier notes), so the
 C check uses a 98% floor. The production comparison is the exact one.
 The plan is run through tools/exec_big (exec with a 24M-float arena, 48M-float weights), since a 10 s clip
@@ -16,14 +16,14 @@ import numpy as np
 
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, KIT)
-sys.path.insert(0, os.path.expanduser('~/oido/port'))
+sys.path.insert(0, os.path.expanduser('~/speech-app/port'))
 from gpuport import Arena, Weights, Plan, ops
 from gpuport.run import run
 from gpuport.config import WORK_DIR
 
 
 
-from gpuport.nemo8 import (load_nemo_ref, prepare, build, collapse, OIDO, MODEL, PROD_W, SHADERS,
+from gpuport.nemo8 import (load_nemo_ref, prepare, build, collapse, SPEECH_APP, MODEL, PROD_W, SHADERS,
                            ARENA_FLOATS)
 EXEC_BIG = os.path.join(KIT, 'tools', 'exec_big')
 
@@ -38,8 +38,8 @@ def main():
     print(f'weights: kit {mine.size} floats, production {prod.size}; byte-identical: {same}')
     ok_all = same
     V = L['V']; toks = L['tokens']
-    for clip, ref_file in [('tarel40', 'tarel40_logits.bin'), ('speak', 'speak_logits.bin')]:
-        pcm = np.fromfile(os.path.join(OIDO, clip + '.pcm'), '<i2')
+    for clip, ref_file in [('clip10s', 'clip10s_logits.bin'), ('clip5s', 'speak_logits.bin')]:
+        pcm = np.fromfile(os.path.join(SPEECH_APP, clip + '.pcm'), '<i2')
         plan, ar, R, T = build(len(pcm), L)
         arena_in = pcm.astype(np.float32) / 32768.0
         t0 = time.time()
@@ -47,7 +47,7 @@ def main():
                       exec_bin=EXEC_BIG, arena_floats=ARENA_FLOATS)
         wall = time.time() - t0
         logits = out.reshape(T, V + 1)
-        ref = np.fromfile(os.path.join(OIDO, ref_file), '<f4').reshape(-1, V + 1)
+        ref = np.fromfile(os.path.join(SPEECH_APP, ref_file), '<f4').reshape(-1, V + 1)
         ok_shape = ref.shape[0] == T
         if not ok_shape:
             print(f'{clip}: frames {T} vs reference {ref.shape[0]}')

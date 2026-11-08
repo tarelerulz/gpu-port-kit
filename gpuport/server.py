@@ -1,4 +1,4 @@
-"""Resident GPU server: oido's gpu/exec_server2 (24M-float arena and 48M-float weights, loaded once).
+"""Resident GPU server: speech-app's gpu/exec_server2 (24M-float arena and 48M-float weights, loaded once).
 Each request sends a plan file and an arena file; the server runs it and writes the requested output region.
 Avoids the per-run process start, Vulkan setup and weight-file load that the one-shot exec pays."""
 import os
@@ -7,6 +7,7 @@ import threading
 import numpy as np
 from .config import VK_ENV, WORK_DIR, EXEC_ARENA_FLOATS
 from .plan import Plan
+from .gpu_health import last_reset_marker, check_no_reset, gpu_reason_since, GpuHang
 
 EXEC_SERVER2 = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'tools', 'exec_server_fixed')  # built by tools/build_exec_server.sh
 SERVER_ARENA_FLOATS = 24 << 20
@@ -44,11 +45,20 @@ class ExecServer:
             base = os.path.join(self.work, f'srv_{self.seq % 4}')
             plan.write(base + '.plan')
             arena_init.astype('<f4').tofile(base + '.arena')
+            marker = last_reset_marker()
             self.proc.stdin.write(f'{base}.plan {base}.arena 0 {base}.out {out_off} {out_n}\n')
             self.proc.stdin.flush()
             resp = self.proc.stdout.readline()
-            if not resp.startswith('done'):
-                raise RuntimeError('exec_server2: ' + resp.strip())
+            try:
+                if not resp.startswith('done'):
+                    if resp.strip():
+                        raise RuntimeError('exec_server2: ' + resp.strip())
+                    raise RuntimeError('exec_server2: server exited (GPU error). Kernel: '
+                                       + gpu_reason_since(marker))
+                check_no_reset(marker)          # a GPU reset makes the output garbage (Vulkan reports success)
+            except (RuntimeError, GpuHang):
+                self.stop()                     # the next call starts a fresh server on the reset GPU
+                raise
             out = np.fromfile(base + '.out', '<f4')
         return out, float(resp.split()[1])
 

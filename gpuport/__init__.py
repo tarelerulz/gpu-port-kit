@@ -3,7 +3,7 @@
 Modules:
   arena.py    arena regions with the 64-float alignment and 131072-float gap rule
   weights.py  weight blob with 16-float alignment and gemm12 matmul layout (N padded to 12)
-  plan.py     plan writer + linter (the measured rules from the oido port)
+  plan.py     plan writer + linter (the measured rules from the speech-app port)
   ops.py      push-constant layouts for shaders already in use (gemm12, add, ln, glu, silu)
   run.py      run a plan through gpu/exec, prefix runs, per-op timing
   check.py    compare a region against numpy; per-op isolated test; prefix bisect

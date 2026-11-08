@@ -1,6 +1,6 @@
 """Per-dispatch GPU profile of the nemo8 full-GPU plan (tools/exec_prof, Vulkan timestamps).
 Prints time by op type, by stage (front end, each layer, head), and the top dispatches.
-usage: python3 tools/profile_nemo8.py [clip]   (clip = tarel40 or speak; default tarel40)"""
+usage: python3 tools/profile_nemo8.py [clip]   (clip = clip10s or clip5s; default clip10s)"""
 import collections
 import os
 import sys
@@ -11,11 +11,11 @@ import nemo8_rebuild as nb
 from gpuport.run import run
 from gpuport.config import WORK_DIR
 
-clip = sys.argv[1] if len(sys.argv) > 1 else 'tarel40'
+clip = sys.argv[1] if len(sys.argv) > 1 else 'clip10s'
 PROF = os.path.join(KIT, 'tools', 'exec_prof')
 nr = nb.load_nemo_ref(); w, L = nb.prepare(nr)
 wpath = w.save(os.path.join(WORK_DIR, 'nemo8_kit'))
-pcm = np.fromfile(os.path.join(nb.OIDO, clip + '.pcm'), '<i2')
+pcm = np.fromfile(os.path.join(nb.SPEECH_APP, clip + '.pcm'), '<i2')
 plan, ar, R, T = nb.build(len(pcm), L, optimized=True)
 prof_file = os.path.join(WORK_DIR, 'nemo8_prof.txt')
 run(plan, pcm.astype(np.float32) / 32768.0, R['LOG'], T * (L['V'] + 1), weights=wpath, shader_dir=nb.SHADERS,

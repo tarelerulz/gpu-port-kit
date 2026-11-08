@@ -1,13 +1,13 @@
-"""Build tools/exec_prof: oido's exec.c with a 24M-float arena, 48M-float weights, and Vulkan timestamp queries
+"""Build tools/exec_prof: speech-app's exec.c with a 24M-float arena, 48M-float weights, and Vulkan timestamp queries
 around every dispatch. When the env var EXEC_PROF=<file> is set, it writes one line per dispatch:
     <index> <shader> <gpu ms>
-Derived from ~/oido/port/gpu/exec.c by exact string patches (each anchor must occur once), so it follows the source."""
+Derived from ~/speech-app/port/gpu/exec.c by exact string patches (each anchor must occur once), so it follows the source."""
 import os
 import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SRC = os.path.expanduser('~/oido/port/gpu/exec.c')
+SRC = os.path.expanduser('~/speech-app/port/gpu/exec.c')
 OUT = os.path.join(HERE, 'exec_prof')
 PATCHES = [
     ("#define ARENA_FLOATS (8u << 20)", "#define ARENA_FLOATS (24u << 20)"),
