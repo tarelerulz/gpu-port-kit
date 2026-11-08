@@ -10,7 +10,7 @@ WORK_DIR = os.environ.get('GPUPORT_WORK', os.path.join(os.path.dirname(os.path.d
 # PiOS Vulkan loader + v3dv driver (same as ~/opt/pios-vulkan/env.sh).
 VK_ENV = {
     'LD_LIBRARY_PATH': os.path.expanduser('~/opt/pios-vulkan/lib'),
-    'VK_ICD_FILENAMES': os.path.expanduser('~/opt/pios-vulkan/icd/broadcom_icd.json'),
+    'VK_ICD_FILENAMES': os.path.expanduser('~/opt/mesa-v3dv/icd.json'),   # patched Mesa (fence-error fix)
 }
 # exec.c fixed buffer sizes (floats). Plans must stay inside them.
 EXEC_ARENA_FLOATS = 8 << 20
