@@ -34,3 +34,17 @@ def check_no_reset(before):
         raise RuntimeError('cannot read the kernel log to check for a GPU reset (dmesg)')
     if after != before:
         raise GpuHang('GPU reset during this request (kernel: ' + after.strip()[-80:] + '); output discarded')
+
+
+def gpu_reason_since(marker):
+    """The last v3d kernel messages logged after `marker` (from last_reset_marker()), one line.
+    Used in the error message when the server exits with a GPU error."""
+    try:
+        lines = subprocess.run(['dmesg'], capture_output=True, text=True, timeout=10).stdout.splitlines()
+    except Exception:
+        return '(kernel log not readable)'
+    if marker and marker in lines:
+        idx = len(lines) - 1 - lines[::-1].index(marker)
+        lines = lines[idx + 1:]
+    msgs = [l.split('] ', 1)[-1].strip() for l in lines if 'v3d' in l]
+    return ' | '.join(msgs[-3:]) if msgs else '(no v3d messages in the kernel log)'
