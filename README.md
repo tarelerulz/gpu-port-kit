@@ -91,3 +91,20 @@ Config (`gpuport/config.py`) can be overridden with env vars: `GPUPORT_SHADERS` 
 - `selftest.py --timing --oido`: all checks ok (add max diff 0, silu 2.4e-7, gemm12 1.7e-6 / 2.9e-6 incl. 2 row blocks); bisect ok;
   lint catches a 1-group dispatch and a local-size mismatch; `add` 16384 floats 0.105 ms per dispatch after the first.
 - The real nemo8 plan (1 s audio, 399 ops) lints with 0 errors and 23 warnings (front-end shaders are in `gpu/fe/`, no `.comp` next to the `.spv`).
+
+## Model weights (not included)
+The nemo8 model used by the nemo8 tests is published on Hugging Face (the same weights as the oido
+project's `models/nemo8.tnm`):
+- English int8 (used by the tests): https://huggingface.co/lokutor-ai/oido-ctc-small-int8 (CC-BY-4.0, as listed in the oido README; check the page)
+- English int4: https://huggingface.co/lokutor-ai/oido-ctc-small-int4 (CC-BY-SA-4.0 per the oido README)
+- English streaming: https://huggingface.co/lokutor-ai/oido-ctc-small-stream-int8 (CC-BY-SA-4.0 per the oido README)
+
+The tests look for the weights and reference logits in a folder that is set with the environment
+variables in `gpuport/config.py`. The tests that need them say so when the files are missing.
+
+## Licenses
+- The kit's own code and documentation: MIT (see `LICENSE`).
+- `patches/kernel/`: GPL-2.0+, because it changes `drivers/gpu/drm/v3d` (SPDX `GPL-2.0+`).
+- `patches/mesa/`: MIT, because it changes a Mesa file that is MIT-licensed.
+- Not included: the oido runner source (`exec.c`), the asr4all GPU shaders (no license file found
+  in that project), and the model weights (linked above).
