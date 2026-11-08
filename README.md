@@ -4,6 +4,17 @@ Helpers for the workflow in `~/doc/agent-memory/gpu-porting-guide.md` (measured 
 The kit wraps the `exec` batch runner in `~/oido/port/gpu/` (one command buffer, barrier after each dispatch).
 It does not replace the method; it makes each step quick and enforces the rules.
 
+## Quick start
+Needs: a Raspberry Pi 4 or 400 (V3D 4.2) running Linux with a Vulkan loader and the broadcom
+driver, `glslc` (shader compiler), Python 3 with numpy, and a C compiler with the Vulkan headers.
+
+1. Build the batch runner `tools/exec_big` (see `tools/build_exec_big.sh`). It is built from the oido
+   project's `exec.c`, which is not in this repo yet (see "Not included" in the license section).
+2. Point the kit at a Vulkan driver in `gpuport/config.py` (`VK_ENV`). Use the patched driver from
+   `patches/` for hang reporting.
+3. Run `python3 tests/check_runner.py` first. It fails if the runner or driver is broken.
+4. Run `python3 tests/run_all.py` for the full set. The nemo8 test needs the weights (see below).
+
 ## Map of the GPU
 - `GPU_MAP.md`: how the device, plans, memory and layouts work, with measured speed and known gaps. Read this first.
 - `GPU_SHADERS.md`: generated catalog of every shader (local size, bindings, push words). Regenerate: `python3 tools/catalog_shaders.py`.
