@@ -30,7 +30,9 @@ def gemm12(plan, a_off, M, mm, out_off, K=None, N=None, sAm=None, epi=0, a_row_s
         threads = (NP // 12) * ((mb + 3) // 4)
         groups = max(MIN_WORKGROUPS, (threads + 255) // 256)
         gx, gy = split_groups(groups)
-        plan.add('gemm12', 256, gx, gy,
+        # gemm12o4: same math, vec4 stores along N (2026-11-08). Needs N % 4 == 0.
+        name = 'gemm12o4' if N % 4 == 0 else 'gemm12'
+        plan.add(name, 256, gx, gy,
                  [mb, N, K, NP, a_off + r0 * sAm, sAm, 1, mm['wo'], mm['bo'],
                   out_off + r0 * N, N, 1, epi])
     return plan
