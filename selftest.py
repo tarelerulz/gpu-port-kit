@@ -7,7 +7,8 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gpuport import Arena, Weights, Plan, ops, check
 from gpuport.timing import time_op
-from gpuport.config import SHADER_DIR
+from gpuport.config import merged_shader_dir
+SHADER_DIR = merged_shader_dir()
 
 rng = np.random.default_rng(0)
 allok = True
