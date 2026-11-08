@@ -34,10 +34,17 @@ git sparse-checkout set drivers/gpu/drm/v3d
 # 2. Apply the patch from the kernel source root
 git apply /path/to/patches/kernel/v3d-fence-error.patch
 
-# 3. Build against the matching kernel headers (must match `uname -r`)
+# 3. Build against kernel headers for the same version (must match `uname -r`).
+#    The headers tree needs a Makefile and scripts/ (a complete build tree).
+#    Check first:  ls /lib/modules/$(uname -r)/build/Makefile
 cd drivers/gpu/drm/v3d
-make -C /path/to/linux-headers-$(uname -r) M=$PWD CONFIG_DRM_V3D=m modules
+make -C /path/to/kernel-headers-for-$(uname -r) M=$PWD CONFIG_DRM_V3D=m modules
 ```
+
+If `/lib/modules/$(uname -r)/build` is missing or is a dangling link (it was on the test system),
+get a complete headers tree for the same version from a system that has one (for example a
+Raspberry Pi OS root filesystem's `/usr/src/linux-headers-$(uname -r)`), copy it, and point `-C`
+at the copy. The test build used a copied tree this way.
 
 The result is `v3d.ko` in that directory.
 
