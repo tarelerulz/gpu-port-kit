@@ -87,7 +87,7 @@ class Plan:
                 out.append(('warn', f'{where}: no {op.shader}.comp source, local size not checked'))
             if op.shader.startswith('gemm12') and op.push[0] > GEMM12_MAX_ROWS:
                 out.append(('error', f'{where}: gemm12 row block {op.push[0]} > {GEMM12_MAX_ROWS}'))
-            if op.shader == 'gemm12' and op.push[0] == 0:
+            if op.shader.startswith('gemm12') and op.push[0] == 0:
                 out.append(('error', f'{where}: gemm12 with 0 rows'))
         return out
 
