@@ -1,8 +1,8 @@
 """Weight layout tests: each test packs weights the way the blob or shader expects, runs the op on the GPU
 (or checks the layout directly) and compares with numpy.
-Covers: matmul layout (put_mm), 8-bit quantized weights read by oido's nemo_ref.Blob.qlin and fed to the
+Covers: matmul layout (put_mm), 8-bit quantized weights read by speech-app's nemo_ref.Blob.qlin and fed to the
 GPU matmul, LayerNorm gamma/beta, GLU, depthwise conv [k][d] layout.
-Run: python3 ~/gpu-port-kit/tests/test_weight_layouts.py   (needs the GPU; the quantized test needs ~/oido/port)"""
+Run: python3 ~/gpu-port-kit/tests/test_weight_layouts.py   (needs the GPU; the quantized test needs ~/speech-app/port)"""
 import importlib.util
 import os
 import sys
@@ -50,9 +50,9 @@ def test_put_alignment_and_mm_layout():
     record('put/put_mm: 16-float alignment, W^T [K][NP], zero padding, bias', bool(ok))
 
 
-# ---- 2. oido 8-bit quantized reader -> dequantized weights -> GPU matmul ----------------------------
+# ---- 2. speech-app 8-bit quantized reader -> dequantized weights -> GPU matmul ----------------------------
 def load_nemo_ref():
-    path = os.path.expanduser('~/oido/port/nemo_ref.py')
+    path = os.path.expanduser('~/speech-app/port/nemo_ref.py')
     if not os.path.exists(path):
         return None
     spec = importlib.util.spec_from_file_location('nemo_ref', path)
@@ -76,7 +76,7 @@ def pack_q8(q, scale, bias):
 def test_q8_reader_and_gpu():
     nr = load_nemo_ref()
     if nr is None:
-        print('SKIP quantized test: ~/oido/port/nemo_ref.py not found')
+        print('SKIP quantized test: ~/speech-app/port/nemo_ref.py not found')
         return
     n, k, M = 40, 50, 37
     q = rng.integers(-127, 128, size=(n, k)).astype(np.int8)
@@ -84,7 +84,7 @@ def test_q8_reader_and_gpu():
     bias = rng.standard_normal(n).astype(np.float32)
     Bl = nr.Blob.__new__(nr.Blob)
     Bl.b = pack_q8(q, scale, bias); Bl.p = 0
-    W, bread = Bl.qlin(n, k, 8)                  # the oido reader
+    W, bread = Bl.qlin(n, k, 8)                  # the speech-app reader
     ref_W = q.astype(np.float32) * scale[:, None]
     ok_reader = np.allclose(W, ref_W, rtol=0, atol=1e-7) and np.array_equal(bread, bias)
     record('8-bit reader: qlin returns q*scale[row] and bias', bool(ok_reader))

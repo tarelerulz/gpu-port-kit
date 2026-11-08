@@ -1,5 +1,5 @@
 """Catalog every GPU shader: local size, bindings, push-constant words used, header comment, .spv status.
-Scans the shader folders that the oido and asr4all ports use. Writes GPU_SHADERS.md in the kit.
+Scans the shader folders that the speech-app and asr-gpu ports use. Writes GPU_SHADERS.md in the kit.
 usage: python3 tools/catalog_shaders.py
 Re-run after adding shaders; the table is generated, do not edit it by hand."""
 import glob
@@ -7,8 +7,8 @@ import os
 import re
 
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DIRS = [os.path.expanduser('~/oido/port/gpu'), os.path.expanduser('~/oido/port/gpu/fe'),
-        os.path.expanduser('~/oido/port/stream'), os.path.expanduser('~/src/asr4all-gpu/shaders')]
+DIRS = [os.path.expanduser('~/speech-app/port/gpu'), os.path.expanduser('~/speech-app/port/gpu/fe'),
+        os.path.expanduser('~/speech-app/port/stream'), os.path.expanduser('~/src/asr-gpu/shaders')]
 PUSH = re.compile(r'\bp\.u\[(\d+)\]|\bU\((\d+)\)')
 
 

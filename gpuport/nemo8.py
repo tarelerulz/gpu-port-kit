@@ -1,7 +1,7 @@
 """nemo8 full-GPU encoder built only from gpuport helpers (weights, arena, plan, ops, resident server).
-Used by the dictation menu (oido-type.py --gpu-full) and by tests/tools.
+Used by the dictation menu (speech-app-type.py --gpu-full) and by tests/tools.
 Class Nemo8Encoder has start(), transcribe(pcm_int16) -> text, close(), like the old gpu_encoder2.GpuEncoder2.
-The weights are byte-identical to ~/oido/port/cache2/weights.bin (checked by tests/nemo8_rebuild.py)."""
+The weights are byte-identical to ~/speech-app/port/cache2/weights.bin (checked by tests/nemo8_rebuild.py)."""
 import importlib.util
 import json
 import os
@@ -14,21 +14,21 @@ from .config import WORK_DIR, merged_shader_dir
 from .server import ExecServer
 from .int8 import read_q8, pack_linear, quant_op, lin_i8
 
-OIDO = os.path.expanduser('~/oido/port')
-MODEL = os.path.expanduser('~/oido/models/nemo8.tnm')
-PROD_W = os.path.join(OIDO, 'cache2', 'weights.bin')
+SPEECH_APP = os.path.expanduser('~/speech-app/port')
+MODEL = os.path.expanduser('~/speech-app/models/nemo8.tnm')
+PROD_W = os.path.join(SPEECH_APP, 'cache2', 'weights.bin')
 SHADERS = merged_shader_dir()
 ARENA_FLOATS = 24 << 20          # exec_server2 arena (about 10 s of audio fits)
 
 
 def load_nemo_ref():
-    spec = importlib.util.spec_from_file_location('nemo_ref', os.path.join(OIDO, 'nemo_ref.py'))
+    spec = importlib.util.spec_from_file_location('nemo_ref', os.path.join(SPEECH_APP, 'nemo_ref.py'))
     m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m); return m
 
 
 def prepare(nr, model=MODEL, int8=False):
     """int8=True: encoder linears and head stored as packed int8 (kind 'i8'); else float32 (kind 'f32')."""
-    """Same reads and the same put order as ~/oido/port/gpu_encoder2.prepare(), but with kit Weights."""
+    """Same reads and the same put order as ~/speech-app/port/gpu_encoder2.prepare(), but with kit Weights."""
     Bl = nr.Blob(model); hd = Bl.hd
     d, H, ff, k, nl, sc, V, bits = hd[1], hd[2], hd[3], hd[4], hd[5], hd[6], hd[7], hd[8]
     assert hd[9] == 0 and bits == 8

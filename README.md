@@ -1,7 +1,7 @@
 # gpu-port-kit: porting models to the Pi 400 GPU
 
-Helpers for the workflow in `~/doc/agent-memory/gpu-porting-guide.md` (measured on the oido and asr4all ports).
-The kit wraps the `exec` batch runner in `~/oido/port/gpu/` (one command buffer, barrier after each dispatch).
+Helpers for the workflow in `<notes>/gpu-porting-guide.md` (measured on the speech-app and asr-gpu ports).
+The kit wraps the `exec` batch runner in `~/speech-app/port/gpu/` (one command buffer, barrier after each dispatch).
 It does not replace the method; it makes each step quick and enforces the rules.
 
 ## Map of the GPU
@@ -32,10 +32,10 @@ Work through them in the order of the checklist (`NOTES.md` has the boxes).
 | `gpuport/run.py` | `run(plan, arena, out_off, out_n, weights=...)`: runs `exec`, returns output and submit ms |
 | `gpuport/check.py` | `compare`, `op_test` (one op vs numpy), `bisect` (first wrong stage) |
 | `gpuport/timing.py` | `time_op`: per-op ms from repeated dispatches |
-| `tests/test_weight_layouts.py` | weight layout checks: put/put_mm, 8-bit oido reader -> GPU matmul, LayerNorm gamma/beta, GLU, depthwise [k][d] |
+| `tests/test_weight_layouts.py` | weight layout checks: put/put_mm, 8-bit speech-app reader -> GPU matmul, LayerNorm gamma/beta, GLU, depthwise [k][d] |
 | `tests/test_attention_layout.py` | attention chain (pe_gen, pos projection, scores, softmax, S@V) vs numpy at 3 shapes |
 | `tests/run_all.py` | runs all checks |
-| `selftest.py` | checks the kit on the real GPU: add, silu, gemm12 (incl. row-block split), bisect, lint. `--timing`, `--oido` |
+| `selftest.py` | checks the kit on the real GPU: add, silu, gemm12 (incl. row-block split), bisect, lint. `--timing`, `--speech-app` |
 
 Config (`gpuport/config.py`) can be overridden with env vars: `GPUPORT_SHADERS` (dir with `exec` and `*.spv`), `GPUPORT_EXEC`, `GPUPORT_WORK`.
 
@@ -53,7 +53,7 @@ Config (`gpuport/config.py`) can be overridden with env vars: `GPUPORT_SHADERS` 
 ## Timing (step 6)
 `time_op(Plan([...]), arena, out_off, out_n, repeats=20)`. Change one thing at a time, re-run the per-op test after each change.
 
-## Rules built into the kit (source: `~/doc/agent-memory/2026-11-03-gpu-porting-rules.md`)
+## Rules built into the kit (source: `<notes>/2026-11-03-gpu-porting-rules.md`)
 | rule | where enforced |
 |---|---|
 | >= 24 workgroups per dispatch (gemm12 wrong below that) | `dispatch()` clamps; `lint()` error |
@@ -69,25 +69,25 @@ Config (`gpuport/config.py`) can be overridden with env vars: `GPUPORT_SHADERS` 
 ## nemo8 proof and speed
 - `python3 tests/nemo8_rebuild.py`: rebuild check (weights, logits vs production, tokens vs C reference).
 - `python3 tools/nemo8_bench.py 3`: GPU vs CPU speed, writes GPU_NEMO8_BENCH.md.
-- `python3 tools/profile_nemo8.py tarel40`: per-dispatch GPU profile (needs tools/exec_prof).
+- `python3 tools/profile_nemo8.py clip10s`: per-dispatch GPU profile (needs tools/exec_prof).
 - `python3 tools/bench_gemm.py`: matmul kernels at nemo8 shapes (GPU_GEMM_BENCH.md).
-- `shaders/`: kit shaders (fe_frame_s, fe_conv0_v2, fe_im2col_v2, gemm12v), merged with the oido and stream shaders by `merged_shader_dir()`.
+- `shaders/`: kit shaders (fe_frame_s, fe_conv0_v2, fe_im2col_v2, gemm12v), merged with the speech-app and stream shaders by `merged_shader_dir()`.
 
 ## Resident server
-- `gpuport/server.py`: `ExecServer(weights, shader_dir)` drives oido's `exec_server2` (weights loaded once). Used by `tools/nemo8_bench.py`.
+- `gpuport/server.py`: `ExecServer(weights, shader_dir)` drives speech-app's `exec_server2` (weights loaded once). Used by `tools/nemo8_bench.py`.
 
 ## Build helpers
 - `tools/build_exec_prof.py`: builds `tools/exec_prof` (per-dispatch timestamps, 24M arena).
-- `tools/build_exec_big.sh`: builds `tools/exec_big` (exec with a 24M arena) from ~/oido/port/gpu/exec.c. Needed by `tests/nemo8_rebuild.py`.
+- `tools/build_exec_big.sh`: builds `tools/exec_big` (exec with a 24M arena) from ~/speech-app/port/gpu/exec.c. Needed by `tests/nemo8_rebuild.py`.
 
 ## Limits
 - `exec` (batch) has a fixed 8M-float arena and 32M-float weights (`exec.c`). The nemo8 full-GPU plan needs ~4.4M floats for 1 s
   of audio; longer utterances need `exec_server2` (24M arena, 48M weights), which the kit does not drive yet.
-- Persistent servers and streaming state (`stream_gpu2.py`) are not wrapped; use them as in `~/oido/port/`.
+- Persistent servers and streaming state (`stream_gpu2.py`) are not wrapped; use them as in `~/speech-app/port/`.
 - The lint reads `.comp` files next to the `.spv`. Shaders in subfolders (e.g. `gpu/fe/`) give a warning, not a check.
 - Attention (`att_*`), the front end and the streaming shaders have no layout test yet.
 
 ## Verified on the Pi (2026-11-04)
-- `selftest.py --timing --oido`: all checks ok (add max diff 0, silu 2.4e-7, gemm12 1.7e-6 / 2.9e-6 incl. 2 row blocks); bisect ok;
+- `selftest.py --timing --speech-app`: all checks ok (add max diff 0, silu 2.4e-7, gemm12 1.7e-6 / 2.9e-6 incl. 2 row blocks); bisect ok;
   lint catches a 1-group dispatch and a local-size mismatch; `add` 16384 floats 0.105 ms per dispatch after the first.
 - The real nemo8 plan (1 s audio, 399 ops) lints with 0 errors and 23 warnings (front-end shaders are in `gpu/fe/`, no `.comp` next to the `.spv`).
