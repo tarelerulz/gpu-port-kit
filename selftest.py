@@ -52,6 +52,23 @@ def test_gemm12():
         allok &= ok
 
 
+def test_gemm12_kscratch():
+    """gemm12 through the k-major path (tr_km + gemm12av4 / gemm12av4o4), vs numpy."""
+    global allok
+    for (M, K, N, epi) in [(37, 52, 20, 0), (37, 52, 20, 2), (300, 64, 40, 0), (300, 64, 33, 0)]:
+        A = rng.standard_normal((M, K)).astype(np.float32)
+        Wm = rng.standard_normal((N, K)).astype(np.float32) * 0.2
+        b = rng.standard_normal(N).astype(np.float32)
+        w = Weights(); mm = w.put_mm(Wm, b)
+        wpath = w.save(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'work', 'gemm_test'))
+        ar = Arena(); ia = ar.alloc('A', M * K); io = ar.alloc('O', M * N); ik = ar.alloc('TK', K * 252)
+        arena = np.zeros(ar.used(), np.float32); arena[ia:ia + M * K] = A.ravel()
+        p = Plan(); ops.gemm12(p, ia, M, mm, io, epi=epi, kscratch=ik)
+        ok, _ = check.op_test(f'gemm12 kscratch M={M} K={K} N={N} epi={epi} ({len(p)} ops)', p, arena, io,
+                              gemm_ref(A, Wm, b, epi), 1e-3, weights=wpath)
+        allok &= ok
+
+
 def test_bisect_and_lint():
     global allok
     n = 512
@@ -85,6 +102,7 @@ def test_timing():
 if __name__ == '__main__':
     test_add_silu()
     test_gemm12()
+    test_gemm12_kscratch()
     test_bisect_and_lint()
     if '--timing' in sys.argv:
         test_timing()

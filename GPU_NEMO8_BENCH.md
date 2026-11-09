@@ -4,5 +4,5 @@ Median of 3 warm runs. GPU = kit plan (optimized front end) on a resident exec_s
 
 | clip | audio s | GPU wall s | GPU kernel ms | GPU process CPU s | CPU wall s | CPU process CPU s | same text |
 |---|---|---|---|---|---|---|---|
-| tarel40 | 10 | 3.89 | 3878 | 0.03 | 0.51 | 1.69 | yes |
-| speak | 5 | 1.71 | 1694 | 0.03 | 0.26 | 0.84 | yes |
+| clip10s | 10 | 2.50 | 2432 | 0.04 | 0.57 | 1.52 | yes |
+| clip5s | 5 | 1.05 | 985 | 0.03 | 0.28 | 0.75 | yes |

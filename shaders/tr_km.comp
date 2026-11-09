@@ -1,0 +1,14 @@
+#version 450
+// Row-major A block [M][K] (row stride sAm, k contiguous) -> k-major [K][Mp] (m contiguous), zero-padded to Mp.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint M = p.u[0], K = p.u[1], Mp = p.u[2], src = p.u[3], sAm = p.u[4], dst = p.u[5];
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= Mp * K) return;
+    uint k = idx / Mp, m = idx % Mp;
+    float v = 0.0;
+    if (m < M) v = a[src + m * sAm + k];
+    a[dst + k * Mp + m] = v;
+}

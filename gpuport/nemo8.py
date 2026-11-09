@@ -86,9 +86,14 @@ def put_lin(w, x):
     return w.put_mm(x[1], x[2])
 
 
-def build(n, L, optimized=True):
+def build(n, L, optimized=True, av4=None):
     """Plan for n samples, same dispatches as gpu_encoder2.build(), written with kit helpers.
-    optimized: padded frame stride (no power-of-two matmul row stride) and the kit's conv0 / im2col shaders."""
+    optimized: padded frame stride (no power-of-two matmul row stride) and the kit's conv0 / im2col shaders.
+    av4 (2026-11-09): matmuls read activations k-major through a transpose (ops.gemm12 kscratch). Default on for
+    optimized plans; GPUPORT_AV4=0 turns it off (old row-major matmuls) for before/after numbers."""
+    if av4 is None:
+        av4 = os.environ.get('GPUPORT_AV4', '1') != '0'
+    av4 = bool(av4) and optimized
     d, H, ff, k, sc, V, f2, fe = L['d'], L['H'], L['ff'], L['k'], L['sc'], L['V'], L['f2'], L['fe']
     V1 = V + 1; nvalid = n // 160; Tm = nvalid + 1
     T2 = (Tm + 2 - 3) // 2 + 1; T3 = (T2 + 2 - 3) // 2 + 1; T = T3; NP = 2 * T - 1
@@ -102,6 +107,9 @@ def build(n, L, optimized=True):
                        ('P', NP * d), ('PE', NP * d), ('ATT', T * d), ('GL', T * d), ('CV', T * d),
                        ('SC', H * T * T), ('LOG', T * V1)]:
         R[name] = ar.alloc(name, size)
+    if av4:
+        # k-major scratch for the transposed matmul input: K <= max(d, ff, 9*sc, 20*sc), 252 rows per block
+        R['TK'] = ar.alloc('TK', max(d, ff, 9 * sc, 20 * sc) * 252)
     p = Plan()
     XIN, FR, RE, IM, PW, MEL = (R[x] for x in ['XIN', 'FR', 'RE', 'IM', 'PW', 'MEL'])
     if optimized:
@@ -124,10 +132,10 @@ def build(n, L, optimized=True):
     else:
         groups = (T3 * 20 * sc * 9 + 63) // 64          # 2-D split as in gpu_encoder2 (shader uses gid.x + gid.y*32768)
         p.add('fe_im2col', 64, min(groups, 32768), (groups + 32767) // 32768, [T3, T2, C0, PAT, sc] + [0] * 27)
-    ops.gemm12(p, PAT, T3 * 20, fe['c2'], C2, K=sc * 9, N=sc, sAm=sc * 9, epi=3)
+    ops.gemm12(p, PAT, T3 * 20, fe['c2'], C2, K=sc * 9, N=sc, sAm=sc * 9, epi=3, kscratch=R.get('TK'))
     p.dispatch('fe_flat', 64, T3 * sc * 20, [T3, sc, C2, FL])
     X, HB, H2, QKV, P, PE, ATT, GL, CV, SC, LOG = (R[x] for x in ['X', 'HB', 'H2', 'QKV', 'P', 'PE', 'ATT', 'GL', 'CV', 'SC', 'LOG'])
-    ops.gemm12(p, FL, T3, fe['sub'], X, K=sc * 20, N=d, sAm=sc * 20)
+    ops.gemm12(p, FL, T3, fe['sub'], X, K=sc * 20, N=d, sAm=sc * 20, kscratch=R.get('TK'))
     p.dispatch('pe_gen', 64, NP * d, [T, d, PE])
     JB = (T + 3) // 4; IB = (T + 1) // 2
     if L.get('int8'):
@@ -137,7 +145,7 @@ def build(n, L, optimized=True):
             quant_op(p_, a_, M_, mm_['k'], mm_['k'], R['Q'], R['QS'])
             lin_i8(p_, R['Q'], R['QS'], M_, mm_, out_, epi)
         else:
-            ops.gemm12(p_, a_, M_, mm_, out_, epi=epi)
+            ops.gemm12(p_, a_, M_, mm_, out_, epi=epi, kscratch=R.get('TK'))
     p.marks = [('front_end', 0)]                    # op index where each stage starts (for profiling)
     for li, lw in enumerate(L['layers']):
         p.marks.append((f'layer{li}', len(p.ops)))

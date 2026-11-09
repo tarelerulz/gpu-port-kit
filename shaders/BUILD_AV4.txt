@@ -1,0 +1,4 @@
+gemm12av4.spv:   glslc --target-env=vulkan1.1 -O -DAV4=1 -I shaders gemm12.comp -o gemm12av4.spv
+gemm12av4o4.spv: glslc --target-env=vulkan1.1 -O -DAV4=1 -DOV4=2 -I shaders gemm12.comp -o gemm12av4o4.spv
+tr_km.spv:       glslc --target-env=vulkan1.1 -O -I shaders tr_km.comp -o tr_km.spv
+gemm12av4*.comp are copies of gemm12.comp (the flags select the variant); tr_km.comp transposes A to k-major.

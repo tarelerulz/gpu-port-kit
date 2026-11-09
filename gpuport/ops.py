@@ -16,24 +16,37 @@ def fbits(x):
     return int(np.float32(x).view(np.uint32))
 
 
-def gemm12(plan, a_off, M, mm, out_off, K=None, N=None, sAm=None, epi=0, a_row_stride=None):
+def gemm12(plan, a_off, M, mm, out_off, K=None, N=None, sAm=None, epi=0, a_row_stride=None, kscratch=None):
     """out[m][n] = epi(bias[n] + sum_k A[m][k] * W[k][n]) for m < M.
     mm is the dict from Weights.put_mm(). A row stride defaults to K; out row stride is N.
     epi: 0 none, 1 hardswish, 2 silu, 3 relu, 4 sigmoid (common.glsl).
-    Row blocks of GEMM12_MAX_ROWS are split (the shader is only correct up to that)."""
+    Row blocks of GEMM12_MAX_ROWS are split (the shader is only correct up to that).
+    kscratch (2026-11-09): arena offset of a scratch region of at least K * 252 floats. When given and A is
+    row-major with K % 4 == 0, each row block is first transposed to k-major by tr_km and read by the AV4 kernel
+    (m contiguous): 2.6-20x faster matmul at the nemo8 shapes, same numbers. The region is reused by each op
+    in turn; the executor puts a barrier after every dispatch."""
     N = mm['n'] if N is None else N
     K = mm['k'] if K is None else K
     sAm = K if sAm is None else sAm
     NP = mm['np']
+    av4 = kscratch is not None and sAm == K and K % 4 == 0
     for r0 in range(0, M, GEMM12_MAX_ROWS):
         mb = min(GEMM12_MAX_ROWS, M - r0)
         threads = (NP // 12) * ((mb + 3) // 4)
         groups = max(MIN_WORKGROUPS, (threads + 255) // 256)
         gx, gy = split_groups(groups)
         # gemm12o4: same math, vec4 stores along N (2026-11-08). Needs N % 4 == 0.
-        name = 'gemm12o4' if N % 4 == 0 else 'gemm12'
+        if av4:
+            Mp = (mb + 3) // 4 * 4
+            tg = max(MIN_WORKGROUPS, (Mp * K + 255) // 256)
+            plan.add('tr_km', 256, tg, 1, [mb, K, Mp, a_off + r0 * sAm, sAm, kscratch])
+            name = 'gemm12av4o4' if N % 4 == 0 else 'gemm12av4'
+            src, sa_m, sa_k = kscratch, 1, Mp
+        else:
+            name = 'gemm12o4' if N % 4 == 0 else 'gemm12'
+            src, sa_m, sa_k = a_off + r0 * sAm, sAm, 1
         plan.add(name, 256, gx, gy,
-                 [mb, N, K, NP, a_off + r0 * sAm, sAm, 1, mm['wo'], mm['bo'],
+                 [mb, N, K, NP, src, sa_m, sa_k, mm['wo'], mm['bo'],
                   out_off + r0 * N, N, 1, epi])
     return plan
 
