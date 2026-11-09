@@ -12,7 +12,7 @@ from .plan import Plan
 from . import ops
 from .config import WORK_DIR, merged_shader_dir
 from .server import ExecServer
-from .int8 import read_q8, pack_linear, quant_op, lin_i8
+from .int8 import read_q8, pack_linear, quant_op, lin_i8, quant_op_km, lin_i8_km
 
 SPEECH_APP = os.path.expanduser('~/speech-app/port')
 MODEL = os.path.expanduser('~/speech-app/models/nemo8.tnm')
@@ -138,12 +138,18 @@ def build(n, L, optimized=True, av4=None):
     ops.gemm12(p, FL, T3, fe['sub'], X, K=sc * 20, N=d, sAm=sc * 20, kscratch=R.get('TK'))
     p.dispatch('pe_gen', 64, NP * d, [T, d, PE])
     JB = (T + 3) // 4; IB = (T + 1) // 2
+    i8km = bool(L.get('int8')) and os.environ.get('GPUPORT_I8KM', '1') != '0'   # 2026-11-09: k-major int8 activations
     if L.get('int8'):
-        R['Q'] = ar.alloc('Q', T * (ff // 4)); R['QS'] = ar.alloc('QS', T)
+        # k-major needs (K/4) * Mp words; Mp <= T + 3
+        R['Q'] = ar.alloc('Q', (ff // 4) * (T + 4) if i8km else T * (ff // 4)); R['QS'] = ar.alloc('QS', T)
     def lin(p_, a_, M_, mm_, out_, epi=0):
         if mm_.get('kind') == 'i8':
-            quant_op(p_, a_, M_, mm_['k'], mm_['k'], R['Q'], R['QS'])
-            lin_i8(p_, R['Q'], R['QS'], M_, mm_, out_, epi)
+            if i8km:
+                quant_op_km(p_, a_, M_, mm_['k'], mm_['k'], R['Q'], R['QS'])
+                lin_i8_km(p_, R['Q'], R['QS'], M_, mm_, out_, epi)
+            else:
+                quant_op(p_, a_, M_, mm_['k'], mm_['k'], R['Q'], R['QS'])
+                lin_i8(p_, R['Q'], R['QS'], M_, mm_, out_, epi)
         else:
             ops.gemm12(p_, a_, M_, mm_, out_, epi=epi, kscratch=R.get('TK'))
     p.marks = [('front_end', 0)]                    # op index where each stage starts (for profiling)

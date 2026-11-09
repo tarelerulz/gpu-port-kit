@@ -1,0 +1,27 @@
+#version 450
+// quant_rows, k-major output (2026-11-09): packed int8 word kq of row m goes to au[qO + kq*Mp + m] (m contiguous),
+// so gemm_i8km reads 4 neighbouring rows with adjacent words. Mp = M rounded up to 4 (push word 6).
+// Otherwise identical to quant_rows.comp (per-row scale at sO+m, scale = max|x|/127, round half to even).
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(std430, binding = 0) buffer AU { uint au[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint m = gl_GlobalInvocationID.x;
+    uint M = p.u[0], K = p.u[1], inO = p.u[2], sIn = p.u[3], qO = p.u[4], sO = p.u[5], Mp = p.u[6];
+    if (m >= M) return;
+    uint base = inO + m * sIn;
+    float mx = 0.0;
+    for (uint k = 0u; k < K; k++) mx = max(mx, abs(a[base + k]));
+    float s = (mx > 0.0) ? mx / 127.0 : 1.0;
+    a[sO + m] = s;
+    uint KQ = K / 4u;
+    for (uint kq = 0u; kq < KQ; kq++) {
+        uint word = 0u;
+        for (uint j = 0u; j < 4u; j++) {
+            int q = int(clamp(roundEven(a[base + 4u * kq + j] / s), -127.0, 127.0));
+            word |= (uint(q) & 0xffu) << (8u * j);
+        }
+        au[qO + kq * Mp + m] = word;
+    }
+}
