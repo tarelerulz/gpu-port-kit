@@ -160,7 +160,7 @@ def build(n, L, optimized=True, av4=None):
         ops.ln(p, T, d, X, HB, lw['n_att']); lin(p, HB, T, lw['qkv'], QKV)
         lin(p, PE, NP, lw['pos'], P)
         push = [T, d, H, dh, QKV, P, SC, lw['pbu'], lw['pbv']]
-        p.dispatch('att_scores5', 64, H * T * JB, push + [0] * 23)
+        p.dispatch('att_scores5jf', 64, H * T * JB, push + [0] * 23)
         p.dispatch('att_softmax', 64, H * T, push + [ATT] + [0] * 22)
         p.add('att_pv6', 64, max(24, (H * IB * (dh // 4) + 63) // 64), 1, push + [ATT] + [0] * 22)
         lin(p, ATT, T, lw['out'], HB); ops.add(p, T * d, X, HB, 1.0)

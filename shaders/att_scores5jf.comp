@@ -1,0 +1,46 @@
+#version 450
+// scores S[h][i][j] = scale*(qu_i . k_j + qv_i . P[T-1-i+j]); one invocation per (h, i, 4 consecutive j).
+// Loop over the 11 vec4 chunks of the head dimension outermost, so only a few values are live (no register spill).
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(std430, binding = 0) buffer A4 { vec4 a4[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(std430, binding = 1) readonly buffer W4 { vec4 w4[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    uint T = p.u[0], d = p.u[1], H = p.u[2], dh = p.u[3];
+    uint qkvO = p.u[4], PO = p.u[5], SO = p.u[6], pbuO = p.u[7], pbvO = p.u[8];
+    uint JB = (T + 3u) / 4u;
+    uint total = H * T * JB;
+    if (id >= total) return;
+    uint hh = id / (T * JB), rem = id % (T * JB), jb = rem / T, i = rem % T;   // 2026-11-09: lanes share jb (same key rows)
+    float scale = 1.0 / sqrt(float(dh));
+    uint nv = dh / 4u;
+    uint qv0 = (qkvO + i * 3u * d + hh * dh) / 4u;
+    uint pbu4 = (pbuO + hh * dh) / 4u, pbv4 = (pbvO + hh * dh) / 4u;
+    float ac0 = 0.0, ac1 = 0.0, ac2 = 0.0, ac3 = 0.0, bd0 = 0.0, bd1 = 0.0, bd2 = 0.0, bd3 = 0.0;
+    uint j0 = jb * 4u;
+    uint kb0 = (qkvO + min(j0, T - 1u) * 3u * d + d + hh * dh) / 4u;
+    uint kb1 = (qkvO + min(j0 + 1u, T - 1u) * 3u * d + d + hh * dh) / 4u;
+    uint kb2 = (qkvO + min(j0 + 2u, T - 1u) * 3u * d + d + hh * dh) / 4u;
+    uint kb3 = (qkvO + min(j0 + 3u, T - 1u) * 3u * d + d + hh * dh) / 4u;
+    uint pb0 = (PO + (T - 1u - i + min(j0, T - 1u)) * d + hh * dh) / 4u;
+    uint pb1 = (PO + (T - 1u - i + min(j0 + 1u, T - 1u)) * d + hh * dh) / 4u;
+    uint pb2 = (PO + (T - 1u - i + min(j0 + 2u, T - 1u)) * d + hh * dh) / 4u;
+    uint pb3 = (PO + (T - 1u - i + min(j0 + 3u, T - 1u)) * d + hh * dh) / 4u;
+    for (uint v = 0u; v < nv; v++) {
+        vec4 q = a4[qv0 + v];
+        vec4 qu = q + w4[pbu4 + v];
+        vec4 qv = q + w4[pbv4 + v];
+        ac0 += dot(qu, a4[kb0 + v]); bd0 += dot(qv, a4[pb0 + v]);
+        ac1 += dot(qu, a4[kb1 + v]); bd1 += dot(qv, a4[pb1 + v]);
+        ac2 += dot(qu, a4[kb2 + v]); bd2 += dot(qv, a4[pb2 + v]);
+        ac3 += dot(qu, a4[kb3 + v]); bd3 += dot(qv, a4[pb3 + v]);
+    }
+    uint rowb = SO + (hh * T + i) * T;
+    if (j0 < T) a[rowb + j0] = (ac0 + bd0) * scale;
+    if (j0 + 1u < T) a[rowb + j0 + 1u] = (ac1 + bd1) * scale;
+    if (j0 + 2u < T) a[rowb + j0 + 2u] = (ac2 + bd2) * scale;
+    if (j0 + 3u < T) a[rowb + j0 + 3u] = (ac3 + bd3) * scale;
+}
