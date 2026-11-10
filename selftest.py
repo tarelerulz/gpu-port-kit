@@ -55,16 +55,21 @@ def test_gemm12():
 def test_gemm12_kscratch():
     """gemm12 through the k-major path (tr_km + gemm12av4 / gemm12av4o4), vs numpy."""
     global allok
-    for (M, K, N, epi) in [(37, 52, 20, 0), (37, 52, 20, 2), (300, 64, 40, 0), (300, 64, 33, 0)]:
+    for M, K, N, epi, stride in [(37, 52, 20, 0, 52), (37, 52, 20, 2, 52),
+                                  (300, 64, 40, 0, 64), (300, 64, 33, 0, 64),
+                                  (77, 512, 257, 0, 516), (300, 257, 80, 0, 261)]:
         A = rng.standard_normal((M, K)).astype(np.float32)
         Wm = rng.standard_normal((N, K)).astype(np.float32) * 0.2
         b = rng.standard_normal(N).astype(np.float32)
         w = Weights(); mm = w.put_mm(Wm, b)
         wpath = w.save(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'work', 'gemm_test'))
-        ar = Arena(); ia = ar.alloc('A', M * K); io = ar.alloc('O', M * N); ik = ar.alloc('TK', K * 252)
-        arena = np.zeros(ar.used(), np.float32); arena[ia:ia + M * K] = A.ravel()
-        p = Plan(); ops.gemm12(p, ia, M, mm, io, epi=epi, kscratch=ik)
-        ok, _ = check.op_test(f'gemm12 kscratch M={M} K={K} N={N} epi={epi} ({len(p)} ops)', p, arena, io,
+        ar = Arena(); ia = ar.alloc('A', M * stride); io = ar.alloc('O', M * N); ik = ar.alloc('TK', K * 252)
+        arena = np.zeros(ar.used(), np.float32); padded = np.full((M, stride), np.nan, np.float32)
+        padded[:, :K] = A
+        arena[ia:ia + M * stride] = padded.ravel()
+        p = Plan(); ops.gemm12(p, ia, M, mm, io, epi=epi, sAm=stride, kscratch=ik)
+        assert any(op.shader.startswith('gemm12av4') for op in p.ops)
+        ok, _ = check.op_test(f'gemm12 kscratch M={M} K={K} N={N} stride={stride} epi={epi} ({len(p)} ops)', p, arena, io,
                               gemm_ref(A, Wm, b, epi), 1e-3, weights=wpath)
         allok &= ok
 

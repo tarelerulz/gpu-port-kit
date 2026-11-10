@@ -10,7 +10,7 @@ from .plan import Plan
 from .weights import Weights
 from . import ops
 from .server import ExecServer
-from .config import WORK_DIR, merged_shader_dir
+from .config import WORK_DIR, merged_shader_dir, GEMM12_MAX_ROWS
 from .nemo8 import SHADERS  # merged shader folder (kit + oido shaders)
 
 OIDO_PORT = os.path.expanduser('~/oido/port')
@@ -39,8 +39,10 @@ def prepare(model, work=WORK_DIR):
     return prefix + '.bin', fe, sc, d
 
 
-def build(Tm, n, nrows, zero_row, fe, sc, d):
+def build(Tm, n, nrows, zero_row, fe, sc, d, av4=None):
     """Plan for one window: Tm mel rows, n window samples (sample 0 = absolute 160*a), normalize nrows rows."""
+    if av4 is None:
+        av4 = os.environ.get('GPUPORT_STREAM_AV4', '1') != '0'
     T2 = (Tm + 2 - 3) // 2 + 1; T3 = (T2 + 2 - 3) // 2 + 1
     FRS = 516
     ar = Arena(limit=ARENA_FLOATS)
@@ -49,20 +51,24 @@ def build(Tm, n, nrows, zero_row, fe, sc, d):
                        ('MEL', Tm * 80), ('C0', T2 * 40 * sc), ('PAT', T3 * 20 * sc * 9), ('C2', T3 * 20 * sc),
                        ('FL', T3 * sc * 20), ('X', T3 * d)]:
         R[name] = ar.alloc(name, size)
+    # Shared transpose scratch, above all live regions; reused between matmuls.
+    if av4:
+        rows = (min(GEMM12_MAX_ROWS, max(Tm, T3 * 20)) + 3) // 4 * 4
+        R['TK'] = ar.alloc('TK', max(512, 257, sc * 9, sc * 20) * rows)
     p = Plan()
     XIN, FR, RE, IM, PW, MEL = (R[x] for x in ['XIN', 'FR', 'RE', 'IM', 'PW', 'MEL'])
     p.dispatch('fe_frame_s', 64, Tm * 512, [Tm, n, XIN, FR, fe['win'], FRS])
-    ops.gemm12(p, FR, Tm, fe['dft_c'], RE, K=512, N=257, sAm=FRS)
-    ops.gemm12(p, FR, Tm, fe['dft_s'], IM, K=512, N=257, sAm=FRS)
+    ops.gemm12(p, FR, Tm, fe['dft_c'], RE, K=512, N=257, sAm=FRS, kscratch=R.get('TK'))
+    ops.gemm12(p, FR, Tm, fe['dft_s'], IM, K=512, N=257, sAm=FRS, kscratch=R.get('TK'))
     p.dispatch('fe_pw', 64, Tm * 257, [Tm, RE, IM, PW])
-    ops.gemm12(p, PW, Tm, fe['mel'], MEL, K=257, N=80, sAm=257)
+    ops.gemm12(p, PW, Tm, fe['mel'], MEL, K=257, N=80, sAm=257, kscratch=R.get('TK'))
     p.dispatch('fe_lognorm_fixed', 64, 80, [nrows, MEL, zero_row, fe['nmean'], fe['nstd']])
     C0, PAT, C2, FL, X = (R[x] for x in ['C0', 'PAT', 'C2', 'FL', 'X'])
     p.dispatch('fe_conv0_v2', 64, T2 * 40, [Tm, MEL, C0, fe['c0_w'], fe['c0_b'], sc, T2])
     p.dispatch('fe_im2col_v2', 64, T3 * 20 * sc, [T3, T2, C0, PAT, sc])
-    ops.gemm12(p, PAT, T3 * 20, fe['c2'], C2, K=sc * 9, N=sc, sAm=sc * 9, epi=3)
+    ops.gemm12(p, PAT, T3 * 20, fe['c2'], C2, K=sc * 9, N=sc, sAm=sc * 9, epi=3, kscratch=R.get('TK'))
     p.dispatch('fe_flat', 64, T3 * sc * 20, [T3, sc, C2, FL])
-    ops.gemm12(p, FL, T3, fe['sub'], X, K=sc * 20, N=d, sAm=sc * 20)
+    ops.gemm12(p, FL, T3, fe['sub'], X, K=sc * 20, N=d, sAm=sc * 20, kscratch=R.get('TK'))
     return p, R, T3, n
 
 
