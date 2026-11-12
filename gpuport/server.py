@@ -14,6 +14,7 @@ SERVER_ARENA_FLOATS = 24 << 20
 EXEC_HYBRID = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'tools', 'exec_hybrid')     # build: tools/build_exec_hybrid.sh
 MM16 = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'shaders', 'qpu', 'mm16.qpu')
 MM16RS = MM16.replace('mm16.qpu', 'mm16rs.qpu')
+MM16RELU = MM16.replace('mm16.qpu', 'mm16relu.qpu')
 
 
 class ExecServer:
@@ -30,7 +31,7 @@ class ExecServer:
         env = dict(os.environ, **VK_ENV)
         cmd = [self.binary, self.weights]
         if os.environ.get('GPUPORT_ASM') == '1':          # hand-written QPU matmul jobs interleaved with the Vulkan plan
-            cmd = [EXEC_HYBRID, self.weights, MM16, MM16RS]
+            cmd = [EXEC_HYBRID, self.weights, MM16, MM16RS, MM16RELU]
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE, text=True, env=env, cwd=self.shader_dir)
         line = self.proc.stderr.readline()          # 'ready' once pipelines and buffers exist

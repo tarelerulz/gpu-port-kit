@@ -248,12 +248,12 @@ def gemm_km_batch(plan, src, M, pitch, mm, out, out_pitch, nb, src_stride, out_s
     return plan
 
 
-def asm_mm(plan, a_off, M, a_pitch, asm, out_off, out_pitch):
+def asm_mm(plan, a_off, M, a_pitch, asm, out_off, out_pitch, relu=False):
     """Hand-written QPU matmul (exec_hybrid runner, work/asm/qpu_mm.py): out[n][m] = bias[n] + sum_k W[k][n] * A[k][m] for m < M <= 256,
     A / out k-major with the given row pitches (floats). asm = dict(wo, k, ntiles, tile_words) from nemo8.put_asm. Not a shader: the
     runner submits it as a raw CSD job. No activation (add a silu / relu op after it)."""
     assert M <= 256
-    plan.add('qpu_mm', 256, 1, 1, [asm['k'], asm['ntiles'], a_off, a_pitch, out_off, out_pitch, asm['wo'], asm['tile_words'], M])
+    plan.add('qpu_mmrelu' if relu else 'qpu_mm', 256, 1, 1, [asm['k'], asm['ntiles'], a_off, a_pitch, out_off, out_pitch, asm['wo'], asm['tile_words'], M])
     return plan
 
 

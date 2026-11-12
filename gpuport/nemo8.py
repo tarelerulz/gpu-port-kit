@@ -117,6 +117,8 @@ def prepare(nr, model=MODEL, int8=False, pos_cache=True):
     asm = None
     if pos_cache and not int8 and os.environ.get('GPUPORT_ASM') == '1':     # QPU kernel weights (f16 pairs), appended
         asm = [{k_: put_asm(w, L_[k_]) for k_ in ASM_KEYS} for L_ in layers]
+        if fe2:
+            asm.append(dict(c2=put_asm(w, ('f32', W2, c2_b))))          # last entry: conv2 (K = 9 sc, relu)
         w.put(np.zeros(16, np.float32))
     return w, dict(d=d, H=H, ff=ff, k=k, nl=nl, sc=sc, V=V, f2=f2, fe=fe, layers=lay, head=head, tokens=toks, int8=int8, pos_tab=pos_tab, fe2=fe2, fe3=fe3, asm=asm)
 
@@ -207,6 +209,7 @@ def _build(n, L, optimized=True, av4=None, att_km=None):
     fe2 = bool(km and L.get('fe2') and os.environ.get('GPUPORT_FE2', '1') != '0' and Tq >= FE2_MIN_T)
     # fe3 (2026-11-12): the DFT as two small matmuls (16 x 32) instead of two dense 512 x 257 ones; GPUPORT_FE3=0 = dense DFT
     fe3 = bool(fe2 and L.get('fe3') and os.environ.get('GPUPORT_FE3', '1') != '0')
+    use_asm = bool(L.get('asm')) and os.environ.get('GPUPORT_ASM') == '1' and 200 <= T <= 256 and km
     Tk = Tp if km else T                     # frames per row of the layer regions
     FRS = 516 if optimized else 512          # padded frame row stride (512 was 7x slower in the DFT matmul)
     ar = Arena(limit=ARENA_FLOATS)
@@ -269,7 +272,10 @@ def _build(n, L, optimized=True, av4=None, att_km=None):
             for dt2 in range(3):
                 ops.gemm_km(p, Z + 2 * f0 * 8 * Tp, T3, Tp, L['fe2']['c0p'][dt2], PL + ((f0 + 1) * 3 + dt2) * sc * Tp, Tp, epi=3)
         p.dispatch('fe_c0fix', 64, 42 * 3 * sc, [T3, T2, sc, Tp, PL])
-        if os.environ.get('GPUPORT_BATCH', '1') != '0':
+        if use_asm and os.environ.get('GPUPORT_ASM_CONV', '1') == '1':     # conv2: 20 QPU jobs (one per column position), relu epilogue
+            for f in range(20):
+                ops.asm_mm(p, PL + 2 * f * 3 * sc * Tp, T3, Tp, L['asm'][-1]['c2'], FLK + f * Tp, 20 * Tp, relu=True)
+        elif os.environ.get('GPUPORT_BATCH', '1') != '0':
             ops.gemm_km_batch(p, PL, T3, Tp, L['fe2']['c2p'], FLK, 20 * Tp, 20, 6 * sc * Tp, Tp, epi=3)
         else:
           for f in range(20):
@@ -294,7 +300,6 @@ def _build(n, L, optimized=True, av4=None, att_km=None):
                 lin_i8(p_, R['Q'], R['QS'], M_, mm_, out_, epi)
         else:
             ops.gemm12(p_, a_, M_, mm_, out_, epi=epi, kscratch=R.get('TK'))
-    use_asm = bool(L.get('asm')) and os.environ.get('GPUPORT_ASM') == '1' and 200 <= T <= 256 and km and Tp * 4 % 4 == 0
     def ASMFF(lw_, key_, li_):        # FF first matmul (+ bias): QPU kernel, then silu on the Vulkan side; else the Mesa kernel
         if use_asm:
             exp_ = os.environ.get('GPUPORT_ASM_EXP')        # timing experiments only: 'none' = no matmul, 'tiny' = one tile

@@ -52,7 +52,7 @@ def emit_block(s, odd, lk=None):
             sub(KCNT, KCNT, 1, cond='pushz')
 
 
-def make_kernel(rs):
+def make_kernel(rs, relu=False):
     @qpu
     def kernel(asm):
         for reg in [ABASE, PI, PI64, PI2, C64, OB, OP, OS2, OTILE, WADDR, WT, KP, NT, MV] + ([RSC] if rs else []):
@@ -116,7 +116,10 @@ def make_kernel(rs):
                     tmuwt()
             else:
                 for j in range(NA):
-                    mov(tmud, ACC[j])
+                    if relu:
+                        fmax(tmud, ACC[j], 0.0)
+                    else:
+                        mov(tmud, ACC[j])
                     mov(tmua, OCUR, cond='ifa' if j % 2 == 0 else 'ifb')
                     add(OCUR, OCUR, C64 if j % 2 == 0 else OS2)
                     tmuwt()
@@ -145,6 +148,7 @@ def make_kernel(rs):
 
 kernel = make_kernel(False)
 kernel_rs = make_kernel(True)
+kernel_relu = make_kernel(False, True)
 
 
 def pack_weights(W, bias):
@@ -159,7 +163,7 @@ def pack_weights(W, bias):
 
 
 def build(path):
-    for k_, p_ in ((kernel, path), (kernel_rs, path.replace('.qpu', 'rs.qpu'))):
+    for k_, p_ in ((kernel, path), (kernel_rs, path.replace('.qpu', 'rs.qpu')), (kernel_relu, path.replace('.qpu', 'relu.qpu'))):
         code = np.array(assemble(k_), dtype=np.uint64)
         code.tofile(p_)
         print(f'{len(code)} instructions -> {p_}')

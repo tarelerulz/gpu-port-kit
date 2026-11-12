@@ -2,9 +2,9 @@
 // Hybrid resident GPU server (exec_hybrid, 2026-11-12 experiment): exec_server2 plus hand-written QPU matmul jobs.
 // Plan op "qpu_mm" (not a shader) is submitted as a raw V3D CSD job on the shared arena / weights (dma-buf), ordered with the Vulkan
 // segments around it by explicit sync files (Vulkan SYNC_FD semaphore -> DRM syncobj -> CSD job -> sync file -> Vulkan semaphore).
-// usage: exec_hybrid weights.bin mm16.qpu [mm16rs.qpu] < requests      (same request protocol as exec_server2)
+// usage: exec_hybrid weights.bin mm16.qpu [mm16rs.qpu [mm16relu.qpu [mm16rm.qpu]]] < requests      (same request protocol as exec_server2)
 // qpu_mm push words: 0 K, 1 ntiles, 2 A_off, 3 A_pitch, 4 O_off, 5 O_pitch (floats), 6 W_off (floats in the weights buffer), 7 tile_words, 8 M
-// qpu_mmrs: same, plus 9 = float bits of the scale: out += scale * (acc + bias) (second code image at +32 KB)
+// qpu_mmrs: same, plus 9 = float bits of the scale: out += scale * (acc + bias) (second code image at +32 KB); qpu_mmrelu: relu epilogue, no bias-free change (third image at +64 KB); qpu_mmrm: output row-major [m][n] with row pitch push[5] floats (fourth image at +96 KB)
 // Resident GPU server (exec_server2) for the Pi 400 V3D Vulkan path. Copyright (c) 2026 gpu-port-kit contributors. See LICENSE.
 // Run a plan of compute dispatches in one command buffer with a barrier after each.
 // usage: exec plan.txt arena_in.bin weights_in.bin arena_out.bin out_off out_n
@@ -95,15 +95,19 @@ static void csd_submit(uint32_t code_va, uint32_t uniforms_va, uint32_t in_sync,
     c.bo_handles = (uintptr_t)bos; c.bo_handle_count = 3; c.in_sync = in_sync; c.out_sync = out_sync;
     DCK(ioctl(dfd, DRM_IOCTL_V3D_SUBMIT_CSD, &c));
 }
-static void drm_setup(Buf *A, Buf *W, const char *codepath, const char *codepath2) {
+static void drm_setup(Buf *A, Buf *W, int ncode, char **codepaths) {
     dfd = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC); DCK(dfd);
     hA = import_bo(A->fd, &vaA); hW = import_bo(W->fd, &vaW);
     struct drm_v3d_create_bo cb = { .size = CODE_BO }; DCK(ioctl(dfd, DRM_IOCTL_V3D_CREATE_BO, &cb)); hC = cb.handle; vaC = cb.offset;
     struct drm_v3d_mmap_bo mb = { .handle = hC }; DCK(ioctl(dfd, DRM_IOCTL_V3D_MMAP_BO, &mb));
     uint8_t *m = mmap(NULL, CODE_BO, PROT_READ | PROT_WRITE, MAP_SHARED, dfd, mb.offset); if (m == MAP_FAILED) { perror("mmap"); exit(1); }
-    FILE *f = fopen(codepath, "rb"); if (!f) { fprintf(stderr, "no qpu code %s\n", codepath); exit(1); }
-    size_t n = fread(m, 1, 32768, f); fclose(f); ubo = (uint32_t *)(m + 65536);
-    if (codepath2) { f = fopen(codepath2, "rb"); if (!f) { fprintf(stderr, "no qpu code %s\n", codepath2); exit(1); } if (fread(m + 32768, 1, 32768, f) == 0) exit(1); fclose(f); } fprintf(stderr, "qpu code %zu bytes at va 0x%x; arena va 0x%x weights va 0x%x\n", n, vaC, vaA, vaW);
+    size_t n = 0;
+    for (int ci = 0; ci < ncode && ci < 4; ci++) {
+        FILE *f = fopen(codepaths[ci], "rb"); if (!f) { fprintf(stderr, "no qpu code %s\n", codepaths[ci]); exit(1); }
+        n += fread(m + ci * 32768, 1, 32768, f); fclose(f);
+    }
+    ubo = (uint32_t *)(m + 131072);
+    fprintf(stderr, "qpu code %zu bytes at va 0x%x; arena va 0x%x weights va 0x%x\n", n, vaC, vaA, vaW);
 }
 int main(int argc, char **argv) {
     if (argc < 3) { fprintf(stderr, "usage: exec_hybrid weights.bin mm16.qpu < requests\n"); return 1; }
@@ -148,7 +152,7 @@ int main(int argc, char **argv) {
     VkCommandBuffer cb; CK(vkAllocateCommandBuffers(dev, &cba, &cb));
     VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
     VkFence fence; CK(vkCreateFence(dev, &fci, NULL, &fence));
-    drm_setup(&A, &W, argv[2], argc > 3 ? argv[3] : NULL);
+    drm_setup(&A, &W, argc - 2, &argv[2]);
     VkExportSemaphoreCreateInfo esi = { .sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO, .handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT };
     VkSemaphoreCreateInfo sci = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &esi };
     VkSemaphore semS, semW; CK(vkCreateSemaphore(dev, &sci, NULL, &semS)); CK(vkCreateSemaphore(dev, &sci, NULL, &semW));
@@ -179,7 +183,7 @@ int main(int argc, char **argv) {
         int ncb = 0, i0 = 0, need_wait = 0, nasm = 0; uint32_t h_prev = 0;
         CK(vkResetFences(dev, 1, &fence));
         for (int i = 0; i <= nops; i++) {
-            int is_asm = (i < nops) && (!strcmp(ops[i].name, "qpu_mm") || !strcmp(ops[i].name, "qpu_mmrs"));
+            int is_asm = (i < nops) && (!strcmp(ops[i].name, "qpu_mm") || !strcmp(ops[i].name, "qpu_mmrs") || !strcmp(ops[i].name, "qpu_mmrelu") || !strcmp(ops[i].name, "qpu_mmrm"));
             if (i < nops && !is_asm) continue;
             /* ---- Vulkan segment [i0, i) ---- */
             uint32_t h_in = 0; int made_in = 0;
@@ -218,9 +222,10 @@ int main(int argc, char **argv) {
             uint32_t PI = q[3] * 4, OP = q[5] * 4;
             pu[0] = vaA + q[2] * 4; pu[1] = PI; pu[2] = PI + 64; pu[3] = 2 * PI; pu[4] = 64; pu[5] = vaA + q[4] * 4; pu[6] = OP; pu[7] = OP - 64; pu[8] = 16 * OP;
             pu[9] = vaW + q[6] * 4; pu[10] = q[7] * 4; pu[11] = q[0] / 2; pu[12] = q[1]; pu[13] = q[8]; pu[14] = q[9];
-            int rs = !strcmp(ops[i].name, "qpu_mmrs");
+            int img = !strcmp(ops[i].name, "qpu_mmrs") ? 1 : !strcmp(ops[i].name, "qpu_mmrelu") ? 2 : !strcmp(ops[i].name, "qpu_mmrm") ? 3 : 0;
+            if (img == 3) { pu[6] = OP; pu[7] = 4 - 16 * OP; pu[8] = 64; pu[14] = 16 * OP; }   /* row-major output: row bytes, step after odd acc, tile step, 16 rows */
             uint32_t h_out = syncobj_new();
-            csd_submit(rs ? vaC + 32768 : vaC, vaC + 65536 + nasm * 64, h_in, h_out);
+            csd_submit(vaC + img * 32768, vaC + 131072 + nasm * 64, h_in, h_out);
             if (made_in) syncobj_free(h_in);
             h_prev = h_out; nasm++; i0 = i + 1;
         }
