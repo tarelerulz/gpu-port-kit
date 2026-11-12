@@ -121,7 +121,7 @@ def prepare(nr, model=MODEL, int8=False, pos_cache=True):
     return w, dict(d=d, H=H, ff=ff, k=k, nl=nl, sc=sc, V=V, f2=f2, fe=fe, layers=lay, head=head, tokens=toks, int8=int8, pos_tab=pos_tab, fe2=fe2, fe3=fe3, asm=asm)
 
 
-ASM_KEYS = ('ff1_1', 'ff2_1')          # matmuls run by the hand-written QPU kernel (GPUPORT_ASM=1, exec_hybrid runner)
+ASM_KEYS = ('ff1_1', 'ff2_1', 'ff1_2', 'ff2_2', 'out', 'pw2')   # matmuls run by the hand-written QPU kernel (GPUPORT_ASM=1, exec_hybrid runner)
 
 
 def put_asm(w, x):
@@ -306,6 +306,11 @@ def _build(n, L, optimized=True, av4=None, att_km=None):
             ops.silu(p, lw_[key_]['n'] * Tp, H2, H2)
         else:
             ops.gemm_km(p, HB, T, Tp, lw_[key_], H2, Tp, epi=2)
+    def ASMRS(lw_, key_, li_, src_, scale_):   # matmul with the residual folded in (X += scale * result)
+        if use_asm and os.environ.get('GPUPORT_ASM_RS', '1') == '1':
+            ops.asm_mm_rs(p, src_, T, Tp, L['asm'][li_][key_], X, Tp, scale_)
+        else:
+            ops.gemm_km(p, src_, T, Tp, lw_[key_], X, Tp, resid=scale_)
     p.marks = [('front_end', 0)]                    # op index where each stage starts (for profiling)
     for li, lw in enumerate(L['layers']):
         p.marks.append((f'layer{li}', len(p.ops)))
@@ -313,19 +318,19 @@ def _build(n, L, optimized=True, av4=None, att_km=None):
             tab = dict(off=L['pos_tab']['offs'][li], Tmax=L['pos_tab']['Tmax'], pitch=L['pos_tab']['pitch']) if pos_cache else None
             G = ops.gemm_km; n_ = d * Tp
             ops.ln_km(p, T, d, Tp, X, HB, lw['n_ff1']); ASMFF(lw, 'ff1_1', li)
-            G(p, H2, T, Tp, lw['ff1_2'], X, Tp, resid=0.5)
+            ASMRS(lw, 'ff1_2', li, H2, 0.5)
             ops.ln_km(p, T, d, Tp, X, HB, lw['n_att']); G(p, HB, T, Tp, lw['qkv'], QKV)
             ops.attention_km(p, T, d, H, QKV, PE, lw['pos'], lw['pbu'], lw['pbv'], ATT, R, pos_tab=tab, att_pitch=Tp)
-            G(p, ATT, T, Tp, lw['out'], X, Tp, resid=1.0)
+            ASMRS(lw, 'out', li, ATT, 1.0)
             ops.ln_km(p, T, d, Tp, X, HB, lw['n_conv']); G(p, HB, T, Tp, lw['pw1'], H2, Tp)
             if k <= 33:
                 ops.glu_dw_km(p, T, d, k, Tp, H2, GL, CV, lw['dw_w'], lw['dw_b'], act=1)
             else:
                 ops.glu_km(p, d, Tp, H2, GL)
                 ops.dw_km(p, T, d, k, Tp, GL, CV, lw['dw_w'], lw['dw_b'], act=1)
-            G(p, CV, T, Tp, lw['pw2'], X, Tp, resid=1.0)
+            ASMRS(lw, 'pw2', li, CV, 1.0)
             ops.ln_km(p, T, d, Tp, X, HB, lw['n_ff2']); ASMFF(lw, 'ff2_1', li)
-            G(p, H2, T, Tp, lw['ff2_2'], X, Tp, resid=0.5)
+            ASMRS(lw, 'ff2_2', li, H2, 0.5)
             ops.ln_km(p, T, d, Tp, X, X, lw['n_out'])
             continue
         ops.ln(p, T, d, X, HB, lw['n_ff1']); lin(p, HB, T, lw['ff1_1'], H2, epi=2)

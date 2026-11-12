@@ -21,6 +21,7 @@ ACC = [_R["rf%d" % i] for i in range(NA)]
 (OB, OCUR, OP, OS2, OTILE) = [_R["rf%d" % i] for i in range(38, 43)]
 (WADDR, WT, KP, NT, KCNT, TCNT, LANE, ABASE, MV, LM) = [_R["rf%d" % i] for i in range(43, 53)]
 XSET = [(_R["r0"], _R["r1"]), (_R["r2"], _R["r4"])]
+RSC = _R['rf53']                                  # residual scale (rs kernel)
 NPARAM = 14
 
 
@@ -51,80 +52,99 @@ def emit_block(s, odd, lk=None):
             sub(KCNT, KCNT, 1, cond='pushz')
 
 
-@qpu
-def kernel(asm):
-    for reg in [ABASE, PI, PI64, PI2, C64, OB, OP, OS2, OTILE, WADDR, WT, KP, NT, MV]:
-        nop(sig=ldunifrf(reg))
-    tidx(r0)
-    shr(r0, r0, 2)
-    band(r0, r0, 0b1111)
-    shl(r0, r0, 5)
-    eidx(r1)
-    add(LM, r0, r1)                                   # m of lane (vector 0)
-    shl(LANE, LM, 2)
-    add(OB, OB, LANE)
-    add(ABASE, ABASE, LANE)
-    mov(Z, 0)
-    mov(TCNT, NT)
-    nop(sig=thrsw)
-    nop()
-    nop()
-
-    with loop as lt:                                  # over n tiles
-        mov(unifa, WADDR)
-        add(WADDR, WADDR, WT)
-        mov(KCNT, KP)
-        add(tmua, ABASE, Z)                           # x requests for k = 0 and k = 1
-        add(tmua, ABASE, C64)
-        add(P0, ABASE, PI)
-        add(tmua, P0, Z)
-        add(tmua, P0, C64)
-        add(P0, P0, PI)                               # P0 = k 2
-        mov(r3, 0.0)
-        nop(sig=ldtmu(r0))
-        nop(sig=ldtmu(r1))
-        nop()
-        nop(sig=ldunifa)                              # bias 0 -> r5
-        for n in range(16):                           # accumulators start at the bias; the last signal fetches weight pair 0
-            mov(ACC[2 * n], r5, sig=ldunifa).mov(ACC[2 * n + 1], r5)
-
-        with loop as lk:
-            emit_block(0, False)
-            emit_block(1, True, lk)
-
-        fadd(ACC[NA - 1], ACC[NA - 1], r3)
-        nop(sig=ldtmu(r0))
-        nop(sig=ldtmu(r1))
-
-        mov(r1, 1)
-        shl(r1, r1, 4)                                # 16 (small immediates stop at 15)
-        add(r0, LM, r1)                               # flags: A = vector 0 lanes with m < M, B = vector 1 lanes
-        sub(null, r0, MV, cond='pushn')
-        sub(null, LM, MV, cond='pushn')
-        mov(OCUR, OB)
-        for j in range(NA):
-            mov(tmud, ACC[j])
-            mov(tmua, OCUR, cond='ifa' if j % 2 == 0 else 'ifb')
-            add(OCUR, OCUR, C64 if j % 2 == 0 else OS2)
-            tmuwt()
-        add(OB, OB, OTILE)
-        sub(TCNT, TCNT, 1, cond='pushz')
-        lt.b(cond='anyna')
-        nop()
+def make_kernel(rs):
+    @qpu
+    def kernel(asm):
+        for reg in [ABASE, PI, PI64, PI2, C64, OB, OP, OS2, OTILE, WADDR, WT, KP, NT, MV] + ([RSC] if rs else []):
+            nop(sig=ldunifrf(reg))
+        tidx(r0)
+        shr(r0, r0, 2)
+        band(r0, r0, 0b1111)
+        shl(r0, r0, 5)
+        eidx(r1)
+        add(LM, r0, r1)                                   # m of lane (vector 0)
+        shl(LANE, LM, 2)
+        add(OB, OB, LANE)
+        add(ABASE, ABASE, LANE)
+        mov(Z, 0)
+        mov(TCNT, NT)
+        nop(sig=thrsw)
         nop()
         nop()
 
-    barrierid(syncb, sig=thrsw)
-    nop()
-    nop()
-    nop(sig=thrsw)
-    nop(sig=thrsw)
-    nop()
-    nop()
-    nop(sig=thrsw)
-    nop()
-    nop()
-    nop()
+        with loop as lt:                                  # over n tiles
+            mov(unifa, WADDR)
+            add(WADDR, WADDR, WT)
+            mov(KCNT, KP)
+            add(tmua, ABASE, Z)                           # x requests for k = 0 and k = 1
+            add(tmua, ABASE, C64)
+            add(P0, ABASE, PI)
+            add(tmua, P0, Z)
+            add(tmua, P0, C64)
+            add(P0, P0, PI)                               # P0 = k 2
+            mov(r3, 0.0)
+            nop(sig=ldtmu(r0))
+            nop(sig=ldtmu(r1))
+            nop()
+            nop(sig=ldunifa)                              # bias 0 -> r5
+            for n in range(16):                           # accumulators start at the bias; the last signal fetches weight pair 0
+                mov(ACC[2 * n], r5, sig=ldunifa).mov(ACC[2 * n + 1], r5)
+
+            with loop as lk:
+                emit_block(0, False)
+                emit_block(1, True, lk)
+
+            fadd(ACC[NA - 1], ACC[NA - 1], r3)
+            nop(sig=ldtmu(r0))
+            nop(sig=ldtmu(r1))
+
+            mov(r1, 1)
+            shl(r1, r1, 4)                                # 16 (small immediates stop at 15)
+            add(r0, LM, r1)                               # flags: A = vector 0 lanes with m < M, B = vector 1 lanes
+            sub(null, r0, MV, cond='pushn')
+            sub(null, LM, MV, cond='pushn')
+            mov(OCUR, OB)
+            if rs:
+                for j in range(NA):                       # out += scale * (acc incl. bias): read, multiply-add, store
+                    mov(tmua, OCUR)
+                    fmul(r3, ACC[j], RSC)
+                    nop(sig=ldtmu(r0))
+                    fadd(r1, r0, r3)
+                    mov(tmud, r1)
+                    mov(tmua, OCUR, cond='ifa' if j % 2 == 0 else 'ifb')
+                    add(OCUR, OCUR, C64 if j % 2 == 0 else OS2)
+                    tmuwt()
+            else:
+                for j in range(NA):
+                    mov(tmud, ACC[j])
+                    mov(tmua, OCUR, cond='ifa' if j % 2 == 0 else 'ifb')
+                    add(OCUR, OCUR, C64 if j % 2 == 0 else OS2)
+                    tmuwt()
+            add(OB, OB, OTILE)
+            sub(TCNT, TCNT, 1, cond='pushz')
+            lt.b(cond='anyna')
+            nop()
+            nop()
+            nop()
+
+        barrierid(syncb, sig=thrsw)
+        nop()
+        nop()
+        nop(sig=thrsw)
+        nop(sig=thrsw)
+        nop()
+        nop()
+        nop(sig=thrsw)
+        nop()
+        nop()
+        nop()
+
+
+    return kernel
+
+
+kernel = make_kernel(False)
+kernel_rs = make_kernel(True)
 
 
 def pack_weights(W, bias):
@@ -139,10 +159,10 @@ def pack_weights(W, bias):
 
 
 def build(path):
-    code = np.array(assemble(kernel), dtype=np.uint64)
-    code.tofile(path)
-    print(f'{len(code)} instructions -> {path}')
-    return code
+    for k_, p_ in ((kernel, path), (kernel_rs, path.replace('.qpu', 'rs.qpu'))):
+        code = np.array(assemble(k_), dtype=np.uint64)
+        code.tofile(p_)
+        print(f'{len(code)} instructions -> {p_}')
 
 
 def test():
@@ -180,10 +200,46 @@ def test():
         print(f'FF1 shape K={K} N={N} M={M}: {dt * 1e3:.2f} ms, max err vs f16-weight reference {err:.2e}, padding columns untouched: {pad_untouched}, finite: {bool(np.isfinite(got[:, :M]).all())}')
 
 
+def test_rs():
+    import time
+    from videocore6.driver import Driver
+    TP, M = 252, 251
+    rng = np.random.default_rng(6)
+    with Driver() as drv:
+        code = drv.program(kernel_rs)
+        for K, N, scale in [(704, 176, 0.5), (176, 176, 1.0)]:
+            Wm = (rng.standard_normal((N, K)) * 0.05).astype(np.float32)
+            bias = (rng.standard_normal(N) * 0.1).astype(np.float32)
+            A0 = (rng.standard_normal((K, M)) * 0.5).astype(np.float32)
+            X0 = rng.standard_normal((N, TP)).astype(np.float32)
+            stream = pack_weights(Wm, bias)
+            A = drv.alloc(((K + 4) * TP + 16,), dtype=np.float32); A[:] = np.nan
+            Af = np.array(A).reshape(-1)
+            for k in range(K):
+                Af[k * TP:k * TP + M] = A0[k]
+            A[:] = Af
+            O = drv.alloc((N * TP + 64,), dtype=np.float32)
+            Ws = drv.alloc((stream.size + 16,), dtype=np.uint32); Ws[:stream.size] = stream
+            u = [A.addresses()[0], TP * 4, TP * 4 + 64, 2 * TP * 4, 64, O.addresses()[0], TP * 4, TP * 4 - 64, 16 * TP * 4,
+                 Ws.addresses()[0], (16 + 8 * K) * 4, K // 2, N // 16, M, int(np.float32(scale).view(np.uint32))]
+            unif = drv.alloc(len(u) + 2, dtype=np.uint32); unif[:len(u)] = np.array(u, dtype=np.uint64).astype(np.uint32)
+            for rep in range(3):
+                O[:N * TP] = X0.reshape(-1)
+                t0 = time.monotonic()
+                drv.execute(code, local_invocation=(16, 1, 1), uniforms=unif.addresses()[0], thread=8)
+                dt = time.monotonic() - t0
+            got = np.array(O)[:N * TP].reshape(N, TP)
+            want = X0[:, :M] + scale * ((Wm.astype(np.float16).astype(np.float32)) @ A0 + bias[:, None])
+            err = np.abs(got[:, :M] - want).max()
+            print(f'RS K={K} N={N} scale={scale}: {dt * 1e3:.2f} ms, max err {err:.2e}, padding columns untouched: {bool((got[:, M:] == X0[:, M:]).all())}')
+
+
 if __name__ == '__main__':
     mode = sys.argv[1] if len(sys.argv) > 1 else 'test'
     here = os.path.dirname(os.path.abspath(__file__))
-    if mode == 'build':
+    if mode == 'testrs':
+        test_rs()
+    elif mode == 'build':
         build(os.path.join(here, 'mm16.qpu'))
     else:
         test()

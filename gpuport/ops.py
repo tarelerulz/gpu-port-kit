@@ -257,6 +257,13 @@ def asm_mm(plan, a_off, M, a_pitch, asm, out_off, out_pitch):
     return plan
 
 
+def asm_mm_rs(plan, a_off, M, a_pitch, asm, out_off, out_pitch, scale):
+    """Like asm_mm but out += scale * (acc + bias) (the residual add folded in, qpu_mm.kernel_rs)."""
+    assert M <= 256
+    plan.add('qpu_mmrs', 256, 1, 1, [asm['k'], asm['ntiles'], a_off, a_pitch, out_off, out_pitch, asm['wo'], asm['tile_words'], M, fbits(scale)])
+    return plan
+
+
 def gemm_to_km(plan, a_off, M, mm, out, out_pitch, kscratch, sAm=None, epi=0):
     """Row-major input (transposed through kscratch) -> k-major output. For the step that enters the k-major layers."""
     N, K, NP = mm['n'], mm['k'], mm['np']
