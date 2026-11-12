@@ -10,13 +10,40 @@ void main() {
     uint q = gl_GlobalInvocationID.x;
     uint T = p.u[0], d = p.u[1], ts = p.u[2] / 4u, i4 = p.u[3] / 4u + q, o4 = p.u[4] / 4u + q, gO = p.u[5], bO = p.u[6];
     if (q * 4u >= T) return;
-    vec4 mean = vec4(0.0);
-    for (uint c = 0u; c < d; c++) mean += a4[i4 + c * ts];
+    // 8 channels per step so that 8 independent loads are in flight (the loop is latency-bound: only T/4 invocations)
+    uint d8 = d & ~7u;
+    vec4 m0 = vec4(0.0), m1 = vec4(0.0);
+    uint c = 0u;
+    for (; c < d8; c += 8u) {
+        vec4 x0 = a4[i4 + c * ts], x1 = a4[i4 + (c + 1u) * ts], x2 = a4[i4 + (c + 2u) * ts], x3 = a4[i4 + (c + 3u) * ts];
+        vec4 x4 = a4[i4 + (c + 4u) * ts], x5 = a4[i4 + (c + 5u) * ts], x6 = a4[i4 + (c + 6u) * ts], x7 = a4[i4 + (c + 7u) * ts];
+        m0 += (x0 + x1) + (x2 + x3); m1 += (x4 + x5) + (x6 + x7);
+    }
+    vec4 mean = m0 + m1;
+    for (; c < d; c++) mean += a4[i4 + c * ts];
     mean /= float(d);
-    vec4 var = vec4(0.0);
-    for (uint c = 0u; c < d; c++) { vec4 v = a4[i4 + c * ts] - mean; var += v * v; }
+    vec4 v0s = vec4(0.0), v1s = vec4(0.0);
+    for (c = 0u; c < d8; c += 8u) {
+        vec4 x0 = a4[i4 + c * ts] - mean, x1 = a4[i4 + (c + 1u) * ts] - mean, x2 = a4[i4 + (c + 2u) * ts] - mean, x3 = a4[i4 + (c + 3u) * ts] - mean;
+        vec4 x4 = a4[i4 + (c + 4u) * ts] - mean, x5 = a4[i4 + (c + 5u) * ts] - mean, x6 = a4[i4 + (c + 6u) * ts] - mean, x7 = a4[i4 + (c + 7u) * ts] - mean;
+        v0s += (x0 * x0 + x1 * x1) + (x2 * x2 + x3 * x3); v1s += (x4 * x4 + x5 * x5) + (x6 * x6 + x7 * x7);
+    }
+    vec4 var = v0s + v1s;
+    for (; c < d; c++) { vec4 v = a4[i4 + c * ts] - mean; var += v * v; }
     var /= float(d);
     vec4 inv = 1.0 / sqrt(var + 1e-5);
-    for (uint c = 0u; c < d; c++)
+    for (c = 0u; c < d8; c += 8u) {
+        vec4 x0 = a4[i4 + c * ts], x1 = a4[i4 + (c + 1u) * ts], x2 = a4[i4 + (c + 2u) * ts], x3 = a4[i4 + (c + 3u) * ts];
+        vec4 x4 = a4[i4 + (c + 4u) * ts], x5 = a4[i4 + (c + 5u) * ts], x6 = a4[i4 + (c + 6u) * ts], x7 = a4[i4 + (c + 7u) * ts];
+        a4[o4 + c * ts] = (x0 - mean) * inv * w[gO + c] + w[bO + c];
+        a4[o4 + (c + 1u) * ts] = (x1 - mean) * inv * w[gO + c + 1u] + w[bO + c + 1u];
+        a4[o4 + (c + 2u) * ts] = (x2 - mean) * inv * w[gO + c + 2u] + w[bO + c + 2u];
+        a4[o4 + (c + 3u) * ts] = (x3 - mean) * inv * w[gO + c + 3u] + w[bO + c + 3u];
+        a4[o4 + (c + 4u) * ts] = (x4 - mean) * inv * w[gO + c + 4u] + w[bO + c + 4u];
+        a4[o4 + (c + 5u) * ts] = (x5 - mean) * inv * w[gO + c + 5u] + w[bO + c + 5u];
+        a4[o4 + (c + 6u) * ts] = (x6 - mean) * inv * w[gO + c + 6u] + w[bO + c + 6u];
+        a4[o4 + (c + 7u) * ts] = (x7 - mean) * inv * w[gO + c + 7u] + w[bO + c + 7u];
+    }
+    for (; c < d; c++)
         a4[o4 + c * ts] = (a4[i4 + c * ts] - mean) * inv * w[gO + c] + w[bO + c];
 }

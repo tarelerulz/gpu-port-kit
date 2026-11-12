@@ -11,6 +11,8 @@ from .gpu_health import last_reset_marker, check_no_reset, gpu_reason_since, Gpu
 
 EXEC_SERVER2 = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'tools', 'exec_server_fixed')  # built by tools/build_exec_server.sh
 SERVER_ARENA_FLOATS = 24 << 20
+EXEC_HYBRID = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'tools', 'exec_hybrid')     # build: tools/build_exec_hybrid.sh
+MM16 = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'shaders', 'qpu', 'mm16.qpu')
 
 
 class ExecServer:
@@ -25,9 +27,14 @@ class ExecServer:
         if self.proc is not None and self.proc.poll() is None:
             return self
         env = dict(os.environ, **VK_ENV)
-        self.proc = subprocess.Popen([self.binary, self.weights], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        cmd = [self.binary, self.weights]
+        if os.environ.get('GPUPORT_ASM') == '1':          # hand-written QPU matmul jobs interleaved with the Vulkan plan
+            cmd = [EXEC_HYBRID, self.weights, MM16]
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE, text=True, env=env, cwd=self.shader_dir)
         line = self.proc.stderr.readline()          # 'ready' once pipelines and buffers exist
+        while line and 'ready' not in line and 'failed' not in line and line.startswith('qpu code'):
+            line = self.proc.stderr.readline()      # exec_hybrid prints one info line first
         if 'ready' not in line:
             raise RuntimeError('exec_server2 did not start: ' + line.strip())
         return self
