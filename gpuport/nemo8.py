@@ -233,7 +233,7 @@ def _build(n, L, optimized=True, av4=None, att_km=None):
     fe2 = bool(km and L.get('fe2') and os.environ.get('GPUPORT_FE2', '1') != '0' and Tq >= FE2_MIN_T)
     # fe3 (2026-11-12): the DFT as two small matmuls (16 x 32) instead of two dense 512 x 257 ones; GPUPORT_FE3=0 = dense DFT
     fe3 = bool(fe2 and L.get('fe3') and os.environ.get('GPUPORT_FE3', '1') != '0')
-    use_asm = bool(L.get('asm')) and os.environ.get('GPUPORT_ASM') == '1' and 1 <= T <= 1024 and km and not 129 <= T <= 160 and not 257 <= T <= 351
+    use_asm = bool(L.get('asm')) and os.environ.get('GPUPORT_ASM') == '1' and 1 <= T <= 1024 and km and (os.environ.get('GPUPORT_ASM_GATE') == 'off' or not (129 <= T <= 136 or 257 <= T <= 328))
     att_qpu = bool(use_asm and att_km and os.environ.get('GPUPORT_ASM_ATT', '1') == '1')       # attention scores and A x V on the QPU kernel (packed f16 K / V)
     Tk = Tp if km else T                     # frames per row of the layer regions
     FRS = 516 if optimized else 512          # padded frame row stride (512 was 7x slower in the DFT matmul)
