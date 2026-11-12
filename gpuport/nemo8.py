@@ -430,10 +430,17 @@ class Nemo8Encoder:
         os.makedirs(self.work, exist_ok=True)
         wprefix = os.path.join(self.work, 'nemo8_kit')
         lpath = wprefix + '.json'
-        fresh = os.path.exists(wprefix + '.bin') and os.path.exists(lpath) and 'fe3' in json.load(open(lpath)) and (os.environ.get('GPUPORT_ASM') != '1' or ('asm' in json.load(open(lpath)) and 'pos_asm' in json.load(open(lpath))))
+        fresh = os.path.exists(wprefix + '.bin') and os.path.exists(lpath)
+        if fresh:
+            j_ = json.load(open(lpath))
+            # the blob file must be the one this layout was written with (tests and other tools also save work/nemo8_kit.bin: 2026-11-12 an
+            # overwritten blob without the QPU weights made every transcript empty)
+            fresh = ('fe3' in j_ and j_.get('blob_floats') == os.path.getsize(wprefix + '.bin') // 4
+                     and (os.environ.get('GPUPORT_ASM') != '1' or ('asm' in j_ and 'pos_asm' in j_)))
         if not fresh:                                         # also rebuilds a cache from before the position tables
             w, L = prepare(load_nemo_ref())
             w.save(wprefix)
+            L['blob_floats'] = w.size
             json.dump(L, open(lpath, 'w'))
         self.L = json.load(open(lpath))
         self.weights = wprefix + '.bin'
