@@ -244,11 +244,18 @@ def _build(n, L, optimized=True, av4=None, att_km=None):
     if fe2:
         Z, PL, FLK = R['Z'], R['PL'], R['FLK']
         p.dispatch('fe_phase', 256, 82 * 8 * Tp, [Tm, Tp, MEL, Z])
-        for f0 in range(40):
+        if os.environ.get('GPUPORT_BATCH', '1') != '0':      # 40 column positions in one dispatch per plane (2026-11-12)
+            for dt2 in range(3):
+                ops.gemm_km_batch(p, Z, T3, Tp, L['fe2']['c0p'][dt2], PL + (3 + dt2) * sc * Tp, Tp, 40, 16 * Tp, 3 * sc * Tp, epi=3)
+        else:
+          for f0 in range(40):
             for dt2 in range(3):
                 ops.gemm_km(p, Z + 2 * f0 * 8 * Tp, T3, Tp, L['fe2']['c0p'][dt2], PL + ((f0 + 1) * 3 + dt2) * sc * Tp, Tp, epi=3)
         p.dispatch('fe_c0fix', 64, 42 * 3 * sc, [T3, T2, sc, Tp, PL])
-        for f in range(20):
+        if os.environ.get('GPUPORT_BATCH', '1') != '0':
+            ops.gemm_km_batch(p, PL, T3, Tp, L['fe2']['c2p'], FLK, 20 * Tp, 20, 6 * sc * Tp, Tp, epi=3)
+        else:
+          for f in range(20):
             ops.gemm_km(p, PL + 2 * f * 3 * sc * Tp, T3, Tp, L['fe2']['c2p'], FLK + f * Tp, 20 * Tp, epi=3)
         ops.gemm_km(p, FLK, T3, Tp, fe['sub'], X, Tp)
     else:

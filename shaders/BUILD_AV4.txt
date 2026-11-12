@@ -14,3 +14,5 @@ gemm12av4rs.spv: -DAV4=1 -DOV4=1 -DRS=1   (residual folded in: out += scale * re
 fe_phase.spv, fe_c0fix.spv: no flags (front-end convs as matmuls, 2026-11-12).
 2026-11-12 (UA): all gemm12av4*/wa/wp/rs binaries above are now built with an extra -DUA=1 (unsigned k-major input address, no signed divide per K step).
 2026-11-12 (two-stage DFT, fe3): fe_frame_k.spv, fe_tw.spv, fe_pw2.spv: no flags, local 256 (glslc --target-env=vulkan1.1 -O -I shaders X.comp -o X.spv).
+2026-11-12 (batch, -DBATCH=1 -DUA=1): gemm12av4o1b (AV4 OV4=1), gemm12wa1b (+WA), gemm12wp1b (+WP), gemm12wa2b (OV4=2 +WA). Workgroup y = batch;
+  push u[22] A stride, u[23] out stride, u[24] W stride (WA/WP), floats per batch. Copies of gemm12.comp as gemm12*b.comp.

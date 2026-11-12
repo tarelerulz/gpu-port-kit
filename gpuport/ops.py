@@ -124,6 +124,7 @@ def gemm12v(plan, a_off, M, mm, out_off, K=None, N=None, sAm=None, epi=0):
 #   att_softmax_t   over j, in place
 #   gemm12wa2       per head: ATT[i][h*dh..] = sum_j ST[j][i] * V[j]
 # Threads per workgroup, tuned per shader by measurement (tools: sweep in GPU_MAP section 22). Must match the .comp.
+BATCH = os.environ.get('GPUPORT_BATCH', '1') != '0'      # heads / column positions as workgroup-y batches (2026-11-12)
 LOCAL = {'ln_km4': 256, 'dw_km4': 256, 'att_softmax_t4': 128, 'tr_km': 256, 'att_prep': 256, 'att_comb': 256, 'glu_kmh': 256}
 
 
@@ -175,20 +176,28 @@ def attention_km(plan, T, d, H, qkv, pe, mm_pos, pbu, pbv, att, R, pos=True, pos
                      [mb, d, d, mm_pos['np'], TK, 1, Mp, mm_pos['wo'], mm_pos['bo'], PT + r0, 1, PTP, 0])
     plan.add('att_prep', LOCAL['att_prep'], _g(d * TP, LOCAL['att_prep']), 1, [T, d, dh, TP, qkv, QU, QV, KT, pbu, pbv])
     q4 = (T + 3) // 4
-    for h in range(H):
-        hb = h * dh * TP
-        push = [T, T, dh, TP, QU + hb, 1, TP, KT + hb, none, ST + h * T * TP, 1, TP, 0] + [0] * 8 + [TP]
-        plan.add('gemm12wa1', 256, _g((TP // 12) * q4), 1, push)
-        name, wbase, wpitch = bd or ('gemm12wa1', PT, PTP)
-        NPg = (GR + 11) // 12 * 12
-        push = [T, GR, dh, NPg, QV + hb, 1, TP, wbase + h * dh * wpitch, none, GT + h * GR * TP, 1, TP, 0] + [0] * 8 + [wpitch]
-        plan.add(name, 256, _g((NPg // 12) * q4), 1, push)
+    NPg = (GR + 11) // 12 * 12
+    name, wbase, wpitch = bd or ('gemm12wa1', PT, PTP)
+    if BATCH:      # heads in one dispatch (workgroup y); u[22] A stride, u[23] out stride, u[24] W stride (2026-11-12)
+        plan.add('gemm12wa1b', 256, _g((TP // 12) * q4), H, [T, T, dh, TP, QU, 1, TP, KT, none, ST, 1, TP, 0] + [0] * 8 + [TP, dh * TP, T * TP, dh * TP])
+        plan.add(name + 'b', 256, _g((NPg // 12) * q4), H, [T, GR, dh, NPg, QV, 1, TP, wbase, none, GT, 1, TP, 0] + [0] * 8 + [wpitch, dh * TP, GR * TP, dh * wpitch])
+    else:
+        for h in range(H):
+            hb = h * dh * TP
+            push = [T, T, dh, TP, QU + hb, 1, TP, KT + hb, none, ST + h * T * TP, 1, TP, 0] + [0] * 8 + [TP]
+            plan.add('gemm12wa1', 256, _g((TP // 12) * q4), 1, push)
+            push = [T, GR, dh, NPg, QV + hb, 1, TP, wbase + h * dh * wpitch, none, GT + h * GR * TP, 1, TP, 0] + [0] * 8 + [wpitch]
+            plan.add(name, 256, _g((NPg // 12) * q4), 1, push)
     if fused:       # shift + add + softmax in one pass, 4 queries per thread
         plan.add('att_softmax_t4', LOCAL['att_softmax_t4'], _g(H * q4, LOCAL['att_softmax_t4']), 1, [T, H, TP, ST, GT, e, GR])
     else:
         plan.add('att_comb', LOCAL['att_comb'], _g(H * T * TP, LOCAL['att_comb']), 1, [T, H, TP, ST, GT, e, GR])
         plan.add('att_softmax_t', 64, _g(H * T, 64), 1, [T, H, TP, ST])
     NPv = (dh + 11) // 12 * 12
+    if BATCH and att_pitch:
+        plan.add('gemm12wa1b', 256, _g((NPv // 12) * q4), H,
+                 [T, dh, T, NPv, ST, 1, TP, qkv + 2 * d, none, att, 1, att_pitch, 0] + [0] * 8 + [3 * d, T * TP, dh * att_pitch, dh])
+        return plan
     for h in range(H):
         if att_pitch:     # output k-major: att[c][i], rows of pitch att_pitch (feeds the next matmul with no transpose)
             push = [T, dh, T, NPv, ST + h * T * TP, 1, TP, qkv + 2 * d + h * dh, none, att + h * dh * att_pitch, 1, att_pitch, 0] + [0] * 8 + [3 * d]
@@ -227,6 +236,15 @@ def gemm_km1(plan, src, M, pitch, mm, out, out_pitch, epi=0):
     """gemm_km in ONE dispatch for any M (no 248-row blocks): for tall, short-K matmuls such as the DFT stages (M % 4 == 0)."""
     N, K, NP = mm['n'], mm['k'], mm['np']
     plan.add('gemm12av4o1', 256, _g((NP // 12) * ((M + 3) // 4)), 1, [M, N, K, NP, src, 1, pitch, mm['wo'], mm['bo'], out, 1, out_pitch, epi])
+    return plan
+
+
+def gemm_km_batch(plan, src, M, pitch, mm, out, out_pitch, nb, src_stride, out_stride, epi=0):
+    """nb independent k-major matmuls with the same weights in ONE dispatch (workgroup y = batch): A moves by src_stride,
+    out by out_stride floats per batch (2026-11-12). M <= 251 per batch."""
+    N, K, NP = mm['n'], mm['k'], mm['np']
+    g = _g((NP // 12) * ((M + 3) // 4))
+    plan.add('gemm12av4o1b', 256, g, nb, [M, N, K, NP, src, 1, pitch, mm['wo'], mm['bo'], out, 1, out_pitch, epi] + [0] * 9 + [src_stride, out_stride])
     return plan
 
 

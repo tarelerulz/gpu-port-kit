@@ -19,7 +19,12 @@ layout(std430, binding = 1) readonly buffer WU { uint wu[]; };
 #define LDA(base, idx) a[int(base) + (idx)]
 #define ACC(j, wv, c) s##j += wv.c * x;
 void main() {
+    #if BATCH
+    // batched (2026-11-12): workgroup y = batch index; A and out move by u[22] / u[23] floats per batch
+    uint M = U(0), N = U(1), K = U(2), NP = U(3), q4 = (M + 3u) / 4u, i = gl_GlobalInvocationID.x;
+#else
     uint M = U(0), N = U(1), K = U(2), NP = U(3), q4 = (M + 3u) / 4u, i = tid();
+#endif
 #if UNI
     // No early return (2026-11-12): a return here puts the whole K loop under a per-lane mask on v3d (every register
     // write becomes a conditional move and values spill to memory: 364 instructions per step). Spare threads redo the
@@ -31,7 +36,11 @@ void main() {
 #endif
     uint cg = i / q4, q = i % q4, m0 = q * 4u;
     int sAm = int(U(5)), sAk = int(U(6));
+#if BATCH
+    uint Ab = U(4) + gl_WorkGroupID.y * p.u[22];
+#else
     uint Ab = U(4);
+#endif
     int a0 = int(min(m0, M - 1u)) * sAm, a1 = int(min(m0 + 1u, M - 1u)) * sAm;
     int a2 = int(min(m0 + 2u, M - 1u)) * sAm, a3 = int(min(m0 + 3u, M - 1u)) * sAm;
     vec4 b0 = vec4(0.0), b1 = vec4(0.0), b2 = vec4(0.0);
@@ -46,11 +55,19 @@ void main() {
 #endif
 #if WA
     // W read from the arena (activations as the right-hand matrix), row pitch u[21] floats (2026-11-12, attention)
+#if BATCH
+    uint wb = (p.u[7] + gl_WorkGroupID.y * p.u[24]) / 4u + cg * 3u, ws = p.u[21] / 4u;   // u[24]: W offset per batch
+#else
     uint wb = p.u[7] / 4u + cg * 3u, ws = p.u[21] / 4u;
+#endif
 #define WLD(i) a4[i]
 #elif WP
     // W in the weights with its own row pitch u[21] (a wider table read through a window, 2026-11-12)
+#if BATCH
+    uint wb = (p.u[7] + gl_WorkGroupID.y * p.u[24]) / 4u + cg * 3u, ws = p.u[21] / 4u;   // u[24]: W offset per batch
+#else
     uint wb = p.u[7] / 4u + cg * 3u, ws = p.u[21] / 4u;
+#endif
 #define WLD(i) w4[i]
 #else
     uint wb = p.u[7] / 4u + cg * 3u, ws = NP / 4u;
@@ -93,7 +110,11 @@ void main() {
 #if UNI
     if (!live) return;
 #endif
+#if BATCH
+    uint ob = p.u[9] + gl_WorkGroupID.y * p.u[23], op = U(12);
+#else
     uint ob = p.u[9], op = U(12);
+#endif
     int sOm = int(U(10)), sOn = int(U(11));
 #ifdef POST
     int dR = int(U(13)) - int(ob);
