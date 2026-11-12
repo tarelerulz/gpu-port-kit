@@ -24,7 +24,8 @@ XSET = [(_R["r0"], _R["r1"]), (_R["r2"], _R["r4"])]
 RSC = _R['rf53']                                  # residual scale (rs kernel)
 SE = _R['rf54']                                   # row-major kernel: 16 * row bytes
 GG, GN = _R['rf55'], _R['rf56']
-PASS, WSAVE, TCNT0, OBS = [_R['rf%d' % i] for i in range(57, 61)]   # passes over extra row blocks (M > 256) and the values to restore each pass                   # adaptive partition: this thread's first tile group / number of tile groups
+PASS, WSAVE, TCNT0, OBS = [_R['rf%d' % i] for i in range(57, 61)]
+R0, TTV0, TTV1 = _R['rf61'], _R['rf62'], _R['rf63']      # skew kernel: row shift, per-lane key limit for vector 0 / 1   # passes over extra row blocks (M > 256) and the values to restore each pass                   # adaptive partition: this thread's first tile group / number of tile groups
 NPARAM = 14
 
 
@@ -55,7 +56,7 @@ def emit_block(s, odd, lk=None):
             sub(KCNT, KCNT, 1, cond='pushz')
 
 
-def make_kernel(rs, relu=False, rm=False):
+def make_kernel(rs, relu=False, rm=False, skew=False):
     @qpu
     def kernel(asm):
         for reg in [ABASE, PI, PI64, PI2, C64, OB, OP, OS2, OTILE, WADDR, WT, KP, NT, MV] + ([RSC] if rs else []) + ([SE] if rm else []):
@@ -76,6 +77,9 @@ def make_kernel(rs, relu=False, rm=False):
         nop(sig=ldunifarf(TCNT))
         nop(sig=ldunifarf(MV))
         nop(sig=ldunifarf(PASS))                          # table word 5: passes over blocks of 256 rows
+        if skew and os.environ.get('SKEWDBG') != 'noload':
+            nop(sig=ldunifarf(NT))                        # table word 6: T keys (NT register is free now)
+            nop(sig=ldunifarf(R0))                        # table word 7: row shift R0 = T - 1 + e
         eidx(r1)
         add(LM, LM, r1)                                   # m of lane (vector 0)
         shl(LANE, LM, 2)
@@ -95,6 +99,18 @@ def make_kernel(rs, relu=False, rm=False):
         mov(TCNT0, TCNT)
         mov(OBS, OB)
         mov(Z, 0)
+        if skew and os.environ.get('SKEWDBG') not in ('nottv', 'noprol'):
+            mov(r0, 1)
+            shl(r0, r0, -2)                                  # shift by 30 (shifts are modulo 32; small immediates stop at 15)
+            sub(r2, Z, r0)                                # -2^30: lanes that must never store
+            shr(r1, C64, 2)                               # 16
+            sub(null, LM, MV, cond='pushn')               # vector 0 lane valid (m < M)
+            mov(TTV0, r2)
+            mov(TTV0, NT, cond='ifa')                     # valid lanes: key limit T
+            add(r0, LM, r1)
+            sub(null, r0, MV, cond='pushn')
+            mov(TTV1, r2)
+            mov(TTV1, NT, cond='ifa')
         nop(sig=thrsw)
         nop()
         nop()
@@ -132,7 +148,33 @@ def make_kernel(rs, relu=False, rm=False):
                 sub(null, r0, MV, cond='pushn')
                 sub(null, LM, MV, cond='pushn')
                 mov(OCUR, OB)
-                if rs:
+                if skew and os.environ.get('SKEWDBG') != 'nostore':
+                    # position term written skewed: entry (row r, lane i) goes to key j = r - R0 + i (valid 0 <= j < T), contiguous per key row
+                    sub(r0, TCNT0, TCNT)                          # tiles done by this thread
+                    umul24(r0, r0, GN)
+                    add(r0, r0, GG)                               # first-n tile group index
+                    shl(r0, r0, 4)
+                    sub(r2, LM, R0)
+                    add(r2, r2, r0)                               # J of lane (vector 0) for the tile's first row
+                    shr(r3, C64, 2)                               # 16
+                    for n in range(16):
+                        add(r0, r2, r3)                           # J of vector 1
+                        bxor(r1, r0, -1)                          # ~J < 0  <=>  J >= 0
+                        sub(r0, r0, TTV1)                         # J - T >= 0  <=>  J >= T (or the lane is beyond M)
+                        imax(r1, r1, r0, cond='pushn')             # A = vector 1 lane valid
+                        bxor(r1, r2, -1)
+                        sub(r0, r2, TTV0)
+                        imax(r1, r1, r0, cond='pushn')             # A = vector 0 valid, B = vector 1 valid
+                        mov(tmud, ACC[2 * n])
+                        mov(tmua, OCUR, cond='ifa')
+                        add(OCUR, OCUR, SE)
+                        tmuwt()
+                        mov(tmud, ACC[2 * n + 1])
+                        mov(tmua, OCUR, cond='ifb')
+                        add(OCUR, OCUR, OS2)
+                        tmuwt()
+                        add(r2, r2, 1)
+                elif rs:
                     for j in range(NA):                       # out += scale * (acc incl. bias): read, multiply-add, store
                         mov(tmua, OCUR)
                         fmul(r3, ACC[j], RSC)
@@ -196,6 +238,7 @@ kernel = make_kernel(False)
 kernel_rs = make_kernel(True)
 kernel_relu = make_kernel(False, True)
 kernel_rm = make_kernel(False, False, True)
+kernel_skew = make_kernel(False, False, True, skew=True)
 
 
 def use_render_node():
@@ -206,7 +249,7 @@ def use_render_node():
         D._patched = True
 
 
-def make_table(M, NT, nthreads=8):
+def make_table(M, NT, nthreads=8, T=0, R0=0):
     """Per-thread work table (8 words each): [m block base, first tile group g, tile groups G, tiles, valid m, passes, 0, 0].
     nblk = ceil(M / 32) row blocks of 32. nblk <= 8: G = 8 // nblk tile groups share the n tiles, leftover threads idle (one masked tile).
     nblk > 8: every thread owns block t and repeats for passes of 256 rows (blocks t + 8 p)."""
@@ -216,6 +259,7 @@ def make_table(M, NT, nthreads=8):
         P = (nblk + nthreads - 1) // nthreads
         for t in range(nthreads):
             tab[t] = [t * 32, 0, 1, NT, M, P, 0, 0]
+        tab[:, 6] = T; tab[:, 7] = R0
         return tab
     G = nthreads // nblk
     for t in range(nthreads):
@@ -225,6 +269,7 @@ def make_table(M, NT, nthreads=8):
             tab[t] = [0, 0, 1, 1, 0, 1, 0, 0]
         else:
             tab[t] = [mb * 32, g, G, ntl, M, 1, 0, 0]
+    tab[:, 6] = T; tab[:, 7] = R0
     return tab
 
 
@@ -240,7 +285,7 @@ def pack_weights(W, bias):
 
 
 def build(path):
-    for k_, p_ in ((kernel, path), (kernel_rs, path.replace('.qpu', 'rs.qpu')), (kernel_relu, path.replace('.qpu', 'relu.qpu')), (kernel_rm, path.replace('.qpu', 'rm.qpu'))):
+    for k_, p_ in ((kernel, path), (kernel_rs, path.replace('.qpu', 'rs.qpu')), (kernel_relu, path.replace('.qpu', 'relu.qpu')), (kernel_rm, path.replace('.qpu', 'rm.qpu')), (kernel_skew, path.replace('.qpu', 'sk.qpu'))):
         code = np.array(assemble(k_), dtype=np.uint64)
         code.tofile(p_)
         print(f'{len(code)} instructions -> {p_}')

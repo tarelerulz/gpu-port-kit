@@ -103,11 +103,11 @@ static void drm_setup(Buf *A, Buf *W, int ncode, char **codepaths) {
     struct drm_v3d_mmap_bo mb = { .handle = hC }; DCK(ioctl(dfd, DRM_IOCTL_V3D_MMAP_BO, &mb));
     uint8_t *m = mmap(NULL, CODE_BO, PROT_READ | PROT_WRITE, MAP_SHARED, dfd, mb.offset); if (m == MAP_FAILED) { perror("mmap"); exit(1); }
     size_t n = 0;
-    for (int ci = 0; ci < ncode && ci < 4; ci++) {
+    for (int ci = 0; ci < ncode && ci < 5; ci++) {
         FILE *f = fopen(codepaths[ci], "rb"); if (!f) { fprintf(stderr, "no qpu code %s\n", codepaths[ci]); exit(1); }
         n += fread(m + ci * 32768, 1, 32768, f); fclose(f);
     }
-    ubo = (uint32_t *)(m + 131072);
+    ubo = (uint32_t *)(m + 262144);
     fprintf(stderr, "qpu code %zu bytes at va 0x%x; arena va 0x%x weights va 0x%x\n", n, vaC, vaA, vaW);
 }
 int main(int argc, char **argv) {
@@ -184,7 +184,7 @@ int main(int argc, char **argv) {
         int ncb = 0, i0 = 0, need_wait = 0, nasm = 0; uint32_t h_prev = 0;
         CK(vkResetFences(dev, 1, &fence));
         for (int i = 0; i <= nops; i++) {
-            int is_asm = (i < nops) && (!strcmp(ops[i].name, "qpu_mm") || !strcmp(ops[i].name, "qpu_mmrs") || !strcmp(ops[i].name, "qpu_mmrelu") || !strcmp(ops[i].name, "qpu_mmrm"));
+            int is_asm = (i < nops) && (!strcmp(ops[i].name, "qpu_mm") || !strcmp(ops[i].name, "qpu_mmrs") || !strcmp(ops[i].name, "qpu_mmrelu") || !strcmp(ops[i].name, "qpu_mmrm") || !strcmp(ops[i].name, "qpu_mmsk"));
             if (i < nops && !is_asm) continue;
             /* ---- Vulkan segment [i0, i) ---- */
             uint32_t h_in = 0; int made_in = 0;
@@ -237,12 +237,17 @@ int main(int argc, char **argv) {
                         else { uint32_t row[8] = { (t % nblk) * 32, t / nblk, G, (uint32_t)ntl, M, 1, 0, 0 }; memcpy(tb + t * 8, row, 32); }
                     }
                 }
-                pu[12] = vaC + 131072 + nasm * 512 + 64;
+                pu[12] = vaC + 262144 + nasm * 512 + 64;
             }
-            int img = !strcmp(ops[i].name, "qpu_mmrs") ? 1 : !strcmp(ops[i].name, "qpu_mmrelu") ? 2 : !strcmp(ops[i].name, "qpu_mmrm") ? 3 : 0;
+            int img = !strcmp(ops[i].name, "qpu_mmrs") ? 1 : !strcmp(ops[i].name, "qpu_mmrelu") ? 2 : !strcmp(ops[i].name, "qpu_mmrm") ? 3 : !strcmp(ops[i].name, "qpu_mmsk") ? 4 : 0;
+            if (img == 4) {   /* skewed position term: lane stride (TP+1) floats, key row stride TP floats, base moved back by R0 rows; table words 6, 7 = T, R0 */
+                uint32_t TPf = q[5], LS = (TPf + 1) * 4, NS = TPf * 4, R0 = q[12];
+                pu[5] = vaA + (uint32_t)((int32_t)q[4] - (int32_t)(R0 * TPf)) * 4; pu[6] = LS; pu[7] = NS - 16 * LS; pu[8] = 16 * NS; pu[14] = 16 * LS;
+                for (uint32_t t = 0; t < 8; t++) { pu[16 + t * 8 + 6] = q[11]; pu[16 + t * 8 + 7] = R0; }
+            }
             if (img == 3) { pu[6] = OP; pu[7] = 4 - 16 * OP; pu[8] = 64; pu[14] = 16 * OP; }   /* row-major output: row bytes, step after odd acc, tile step, 16 rows */
             uint32_t h_out = syncobj_new();
-            csd_submit(vaC + img * 32768, vaC + 131072 + nasm * 512, h_in, h_out);
+            csd_submit(vaC + img * 32768, vaC + 262144 + nasm * 512, h_in, h_out);
             if (made_in) syncobj_free(h_in);
             h_prev = h_out; nasm++; i0 = i + 1;
         }

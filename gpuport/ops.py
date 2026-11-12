@@ -179,6 +179,7 @@ def attention_km(plan, T, d, H, qkv, pe, mm_pos, pbu, pbv, att, R, pos=True, pos
     q4 = (T + 3) // 4
     NPg = (GR + 11) // 12 * 12
     name, wbase, wpitch = bd or ('gemm12wa1', PT, PTP)
+    skew = bool(qpu and pos_asm is not None and pos_tab is not None and T <= 256 and os.environ.get('GPUPORT_ASM_SKEW', '1') == '1')
     if qpu:        # scores on the QPU kernel: K^T packed to f16 tiles in the arena, one job per head (qpu_pack + qpu_mm, push 10 = 1)
         PK = R['PK']; nts = (T + 15) // 16; tws = 16 + 8 * dh
         plan.add('qpu_pack', 256, (nts * tws + 255) // 256, H, [dh, T, KT, TP, PK, nts, tws, dh * TP, nts * tws])
@@ -186,8 +187,12 @@ def attention_km(plan, T, d, H, qkv, pe, mm_pos, pbu, pbv, att, R, pos=True, pos
             plan.add('qpu_mm', 256, 1, 1, [dh, nts, QU + h * dh * TP, TP, ST + h * T * TP, TP, PK + h * nts * tws, tws, T, 0, 1])
         if pos_asm is not None and pos_tab is not None:       # position term from the static f16 tables (phase = window start mod 16)
             phi, u0, ntp, twp = s4 % 16, s4 // 16, (GR + 15) // 16, 16 + 8 * dh
-            for h in range(H):
-                plan.add('qpu_mm', 256, 1, 1, [dh, ntp, QV + h * dh * TP, TP, GT + h * GR * TP, TP, pos_asm[phi // 4][h] + u0 * twp, twp, T, 0, 0])
+            if skew:     # written already shifted (key j, query i) = row T-1+e + j - i: contiguous for the softmax, no gather
+                for h in range(H):
+                    plan.add('qpu_mmsk', 256, 1, 1, [dh, ntp, QV + h * dh * TP, TP, GT + h * T * TP, TP, pos_asm[phi // 4][h] + u0 * twp, twp, T, 0, 0, T, T - 1 + e])
+            else:
+                for h in range(H):
+                    plan.add('qpu_mm', 256, 1, 1, [dh, ntp, QV + h * dh * TP, TP, GT + h * GR * TP, TP, pos_asm[phi // 4][h] + u0 * twp, twp, T, 0, 0])
         else:
             plan.add(name + 'b', 256, _g((NPg // 12) * q4), H, [T, GR, dh, NPg, QV, 1, TP, wbase, none, GT, 1, TP, 0] + [0] * 8 + [wpitch, dh * TP, GR * TP, dh * wpitch])
     elif BATCH:      # heads in one dispatch (workgroup y); u[22] A stride, u[23] out stride, u[24] W stride (2026-11-12)
@@ -200,7 +205,9 @@ def attention_km(plan, T, d, H, qkv, pe, mm_pos, pbu, pbv, att, R, pos=True, pos
             plan.add('gemm12wa1', 256, _g((TP // 12) * q4), 1, push)
             push = [T, GR, dh, NPg, QV + hb, 1, TP, wbase + h * dh * wpitch, none, GT + h * GR * TP, 1, TP, 0] + [0] * 8 + [wpitch]
             plan.add(name, 256, _g((NPg // 12) * q4), 1, push)
-    if fused:       # shift + add + softmax in one pass, 4 queries per thread
+    if skew:        # position term already shifted by the QPU kernel: add + softmax, no gather
+        plan.add('att_softmax_sk', LOCAL['att_softmax_t4'], _g(H * q4, LOCAL['att_softmax_t4']), 1, [T, H, TP, ST, GT, e, GR])
+    elif fused:       # shift + add + softmax in one pass, 4 queries per thread
         plan.add('att_softmax_t4', LOCAL['att_softmax_t4'], _g(H * q4, LOCAL['att_softmax_t4']), 1, [T, H, TP, ST, GT, e, GR])
     else:
         plan.add('att_comb', LOCAL['att_comb'], _g(H * T * TP, LOCAL['att_comb']), 1, [T, H, TP, ST, GT, e, GR])

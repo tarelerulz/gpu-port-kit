@@ -16,6 +16,7 @@ MM16 = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
 MM16RS = MM16.replace('mm16.qpu', 'mm16rs.qpu')
 MM16RELU = MM16.replace('mm16.qpu', 'mm16relu.qpu')
 MM16RM = MM16.replace('mm16.qpu', 'mm16rm.qpu')
+MM16SK = MM16.replace('mm16.qpu', 'mm16sk.qpu')
 
 
 class ExecServer:
@@ -32,7 +33,7 @@ class ExecServer:
         env = dict(os.environ, **VK_ENV)
         cmd = [self.binary, self.weights]
         if os.environ.get('GPUPORT_ASM') == '1':          # hand-written QPU matmul jobs interleaved with the Vulkan plan
-            cmd = [EXEC_HYBRID, self.weights, MM16, MM16RS, MM16RELU, MM16RM]
+            cmd = [EXEC_HYBRID, self.weights, MM16, MM16RS, MM16RELU, MM16RM, MM16SK]
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE, text=True, env=env, cwd=self.shader_dir)
         line = self.proc.stderr.readline()          # 'ready' once pipelines and buffers exist
