@@ -1,0 +1,18 @@
+#version 450
+// GLU on k-major data, output with a zero halo for the depthwise conv (2026-11-12):
+// in = 2d rows of pitch TP; out = d rows of pitch TPH = TP + 32, frame t at column 16 + t, zeros elsewhere.
+// u: 0 T, 1 d, 2 TP, 3 TPH, 4 in, 5 out
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint idx = gl_GlobalInvocationID.x, T = p.u[0], d = p.u[1], TP = p.u[2], TPH = p.u[3];
+    if (idx >= d * TPH) return;
+    uint c = idx / TPH, x = idx % TPH;
+    float v = 0.0;
+    if (x >= 16u && x - 16u < T) {
+        uint s = p.u[4] + c * TP + x - 16u;
+        v = a[s] / (1.0 + exp(-a[s + d * TP]));
+    }
+    a[p.u[5] + idx] = v;
+}

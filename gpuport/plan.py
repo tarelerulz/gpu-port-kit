@@ -85,8 +85,12 @@ class Plan:
                                          '(the literal in the shader is what runs)'))
             else:
                 out.append(('warn', f'{where}: no {op.shader}.comp source, local size not checked'))
-            if op.shader.startswith('gemm12') and op.push[0] > GEMM12_MAX_ROWS:
+            if op.shader.startswith('gemm12') and op.push[0] > GEMM12_MAX_ROWS and op.push[2] > 64:   # tall blocks only cost with long K (DFT stages: K 13 / 64, 2026-11-12)
                 out.append(('error', f'{where}: gemm12 row block {op.push[0]} > {GEMM12_MAX_ROWS}'))
+            if op.shader in ('gemm12', 'gemm12o4') and op.push[6] == 1 and op.push[5] >= 512 \
+                    and op.push[5] & (op.push[5] - 1) == 0:
+                out.append(('warn', f'{where}: row-major input with power-of-two row stride {op.push[5]} '
+                                    '(measured 7x slower at 512; pad the stride, e.g. +4, or pass kscratch)'))
             if op.shader.startswith('gemm12') and op.push[0] == 0:
                 out.append(('error', f'{where}: gemm12 with 0 rows'))
         return out

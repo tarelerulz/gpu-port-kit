@@ -1,0 +1,24 @@
+#version 450
+// Frames for the two-stage DFT (2026-11-12): sample i = 32 * n1 + n2 of frame t goes to a1[n1 * Mp + t * 32 + n2]
+// (k-major input of the stage-1 matmul, K = 13 rows n1, rows m = t * 32 + n2). Same window / pre-emphasis as fe_frame_s.
+// u: 0 Tm, 1 n, 2 xO, 3 a1O, 4 winO, 5 Mp
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    uint Tm = p.u[0], n = p.u[1], xO = p.u[2], aO = p.u[3], winO = p.u[4], Mp = p.u[5];
+    if (id >= Tm * 416u) return;
+    uint t = id / 416u, i = id % 416u;
+    float v = 0.0;
+    if (i < 400u) {
+        int s = int(160u * t) - 200 + int(i);
+        if (s >= 0 && s < int(n)) {
+            float x0 = a[xO + uint(s)];
+            float pv = (s == 0) ? x0 : (x0 - 0.97 * a[xO + uint(s - 1)]);
+            v = pv * w[winO + i];
+        }
+    }
+    a[aO + (i >> 5u) * Mp + t * 32u + (i & 31u)] = v;
+}

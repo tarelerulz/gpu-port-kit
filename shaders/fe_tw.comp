@@ -1,0 +1,18 @@
+#version 450
+// Twiddle + regroup between the DFT stages (2026-11-12). Y[n][m] (stage-1 output, m = t * 32 + n2, n = k1 real, 16 + k1 imag,
+// pitch Mp1) -> A2[n2 * 2 + c][t * 16 + k1] (pitch Mp2) multiplied by exp(-2 pi i n2 k1 / 512) (table in the weights).
+// u: 0 Tm, 1 Mp1, 2 Mp2, 3 Y, 4 A2, 5 twO
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    uint Tm = p.u[0], Mp1 = p.u[1], Mp2 = p.u[2], yO = p.u[3], aO = p.u[4], twO = p.u[5];
+    if (id >= Tm * 512u) return;
+    uint k1 = id & 15u, n2 = (id >> 4u) & 31u, t = id >> 9u, m = t * 16u + k1;      // k1 fastest: coalesced writes, cached reads
+    float yr = a[yO + k1 * Mp1 + t * 32u + n2], yi = a[yO + (16u + k1) * Mp1 + t * 32u + n2];
+    float c = w[twO + (n2 * 16u + k1) * 2u], s = w[twO + (n2 * 16u + k1) * 2u + 1u];
+    a[aO + (n2 * 2u) * Mp2 + m] = yr * c - yi * s;
+    a[aO + (n2 * 2u + 1u) * Mp2 + m] = yr * s + yi * c;
+}

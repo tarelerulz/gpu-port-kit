@@ -1,0 +1,32 @@
+#version 450
+// Relative shift + add + softmax in one pass, 4 queries per invocation (2026-11-12). Replaces att_comb + att_softmax_t.
+// ST[h][j][i] (pitch TP, i contiguous) holds the content term; GT[h][r][i] the position term for every offset r.
+// score = ST[j][i] + GT[T-1-i+j+e][i]; softmax over j, in place in ST.
+// u: 0 T, 1 H, 2 TP, 3 ST, 4 GT, 5 e, 6 rows of GT per head
+layout(local_size_x = 128) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(std430, binding = 0) buffer A4 { vec4 a4[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    uint T = p.u[0], H = p.u[1], TP = p.u[2], Q = (T + 3u) / 4u;
+    if (id >= H * Q) return;
+    uint h = id / Q, q = id % Q, ts = TP / 4u;
+    uint s4 = (p.u[3] + h * T * TP) / 4u + q;
+    int tp = int(TP);
+    // position term address for lane m at j = 0: row T-1-i+e, column i (padding lanes reuse the last real query)
+    uint i0 = min(q * 4u, T - 1u), i1 = min(q * 4u + 1u, T - 1u), i2 = min(q * 4u + 2u, T - 1u), i3 = min(q * 4u + 3u, T - 1u);
+    uint gb = p.u[4] + h * p.u[6] * TP + (T - 1u + p.u[5]) * TP;
+    int g0 = int(gb + i0) - int(i0) * tp, g1 = int(gb + i1) - int(i1) * tp;
+    int g2 = int(gb + i2) - int(i2) * tp, g3 = int(gb + i3) - int(i3) * tp;
+    vec4 mx = vec4(-1e30);
+    for (uint j = 0u; j < T; j++) {
+        int o = int(j) * tp;
+        vec4 v = a4[s4 + j * ts] + vec4(a[g0 + o], a[g1 + o], a[g2 + o], a[g3 + o]);
+        a4[s4 + j * ts] = v; mx = max(mx, v);
+    }
+    vec4 sum = vec4(0.0);
+    for (uint j = 0u; j < T; j++) { vec4 e = exp(a4[s4 + j * ts] - mx); a4[s4 + j * ts] = e; sum += e; }
+    vec4 inv = 1.0 / sum;
+    for (uint j = 0u; j < T; j++) a4[s4 + j * ts] *= inv;
+}

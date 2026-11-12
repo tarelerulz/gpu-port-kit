@@ -55,6 +55,12 @@ def run(plan, arena_init, out_off, out_n, weights=None, shader_dir=None, exec_bi
     out = np.fromfile(base + '.arena_out', '<f4')
     if out.size != out_n:
         raise RuntimeError(f'exec wrote {out.size} floats, expected {out_n}')
+    if not os.environ.get('GPUPORT_KEEP'):      # the names hold the pid, so every process left up to 12 files behind
+        for ext in ('.plan', '.arena_in', '.arena_out'):   # (3.3 GB had piled up in work/ and filled /home, 2026-11-12)
+            try:
+                os.remove(base + ext)
+            except OSError:
+                pass
     return out, ms
 
 

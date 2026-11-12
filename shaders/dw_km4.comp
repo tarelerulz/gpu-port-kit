@@ -1,0 +1,33 @@
+#version 450
+// Depthwise conv over time on k-major data, 4 frames per invocation (2026-11-12).
+// in[c] = row of pitch TPH with a 16-column zero halo on each side (frame t at column 16 + t, from glu_kmh);
+// out[c][t], rows of pitch TP. out = act(b[c] + sum_j w[j][c] * in[c][t + j - k/2]); weights [k][d] as for dw4.
+// Each step loads one aligned vec4 and serves 4 taps through fixed swizzles of two neighbouring vec4. k <= 33.
+// u: 0 T, 1 d, 2 k, 3 TP, 4 TPH, 5 in, 6 out, 7 w, 8 bias, 9 act (0 none, 1 silu)
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer A4 { vec4 a4[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint T = p.u[0], d = p.u[1], Q = (T + 3u) / 4u;
+    int k = int(p.u[2]);
+    if (idx >= d * Q) return;
+    uint c = idx / Q, q = idx % Q;
+    uint i4 = (p.u[5] + c * p.u[4]) / 4u + q;        // column 4q of the halo row = frame 4q - 16
+    int j0 = int(p.u[2] / 2u) - 16;                   // tap index that reads column 4q for output frame 4q
+    uint wb = p.u[7] + c;
+    vec4 acc = vec4(w[p.u[8] + c]);
+    vec4 v0 = a4[i4];
+    for (int s = 0; s < 8; s++) {
+        vec4 v1 = a4[i4 + uint(s) + 1u];
+        int j = j0 + 4 * s;
+        if (j >= 0 && j < k)         acc += w[wb + uint(j) * d] * v0;
+        if (j + 1 >= 0 && j + 1 < k) acc += w[wb + uint(j + 1) * d] * vec4(v0.yzw, v1.x);
+        if (j + 2 >= 0 && j + 2 < k) acc += w[wb + uint(j + 2) * d] * vec4(v0.zw, v1.xy);
+        if (j + 3 >= 0 && j + 3 < k) acc += w[wb + uint(j + 3) * d] * vec4(v0.w, v1.xyz);
+        v0 = v1;
+    }
+    if (p.u[9] == 1u) acc = acc / (1.0 + exp(-acc));
+    a4[(p.u[6] + c * p.u[3]) / 4u + q] = acc;
+}

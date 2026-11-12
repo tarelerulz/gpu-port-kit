@@ -1,0 +1,22 @@
+#version 450
+// LayerNorm on k-major data, 4 frames per invocation (2026-11-12): x[c][t], rows of pitch TP, vec4 = 4 frames.
+// Same formula as ln_km (two passes for mean and variance). Padding frames (t >= T) get whatever their input gives.
+// u: 0 T, 1 d, 2 TP, 3 in, 4 out, 5 gamma (weights), 6 beta (weights)
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer A4 { vec4 a4[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint q = gl_GlobalInvocationID.x;
+    uint T = p.u[0], d = p.u[1], ts = p.u[2] / 4u, i4 = p.u[3] / 4u + q, o4 = p.u[4] / 4u + q, gO = p.u[5], bO = p.u[6];
+    if (q * 4u >= T) return;
+    vec4 mean = vec4(0.0);
+    for (uint c = 0u; c < d; c++) mean += a4[i4 + c * ts];
+    mean /= float(d);
+    vec4 var = vec4(0.0);
+    for (uint c = 0u; c < d; c++) { vec4 v = a4[i4 + c * ts] - mean; var += v * v; }
+    var /= float(d);
+    vec4 inv = 1.0 / sqrt(var + 1e-5);
+    for (uint c = 0u; c < d; c++)
+        a4[o4 + c * ts] = (a4[i4 + c * ts] - mean) * inv * w[gO + c] + w[bO + c];
+}

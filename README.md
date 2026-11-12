@@ -53,7 +53,15 @@ Work through them in the order of the checklist (`NOTES.md` has the boxes).
 | `gpuport/run.py` | `run(plan, arena, out_off, out_n, weights=...)`: runs `exec`, returns output and submit ms |
 | `gpuport/check.py` | `compare`, `op_test` (one op vs numpy), `bisect` (first wrong stage) |
 | `gpuport/timing.py` | `time_op`: per-op ms from repeated dispatches |
+| `gpuport/check.py` `guard_run` | memory guard: runs a plan with guard values around every region and reports writes outside the plan's regions, outputs never written, and (with `poison=True`) results that depend on memory the plan did not write |
+| `gpuport/profile.py` | `profile(plan, arena, weights=..., marks=...)`: per-dispatch GPU time of any plan, by shader (with GMAC/s for matmuls), by stage, top dispatches. Needs `tools/exec_prof` |
+| `tests/test_memory_guard.py` | guard on every matmul path (row-major, k-major, padded stride, split rows) and the elementwise ops; also proves the guard catches an overrun and a short write |
+| `tests/stream_guard.py` | guard on the streaming front end and the live streaming encoder chunk plans (`fe`, `enc` or both; not in `run_all`, about 2 minutes) |
+| `tests/nemo8_guard.py` | guard over the whole nemo8 plan: no stray writes, logits do not depend on old arena contents |
 | `tests/test_weight_layouts.py` | weight layout checks: put/put_mm, 8-bit speech-app reader -> GPU matmul, LayerNorm gamma/beta, GLU, depthwise [k][d] |
+| `gpuport/ops.py` `attention_km` | relative-position attention as matmuls on the k-major kernel (GPU_MAP section 19); `tests/test_attention_km.py [--time]` checks it against numpy with the memory guard and times it against the old shaders |
+| `gpuport/ops.py` k-major helpers | `gemm_km`, `gemm_to_km`, `ln_km`, `glu_dw_km`: layers with activations kept as [channel][frame] (GPU_MAP section 21) |
+| `tests/nemo8_lengths.py` | default nemo8 plan vs the exact plan at 15 clip lengths (0.1 s to 12.8 s) |
 | `tests/test_attention_layout.py` | attention chain (pe_gen, pos projection, scores, softmax, S@V) vs numpy at 3 shapes |
 | `tests/run_all.py` | runs all checks |
 | `selftest.py` | checks the kit on the real GPU: add, silu, gemm12 (incl. row-block split), bisect, lint. `--timing`, `--speech-app` |
@@ -71,7 +79,14 @@ Config (`gpuport/config.py`) can be overridden with env vars: `GPUPORT_SHADERS` 
 3. `check.bisect(label, plan, arena_in, checkpoints, weights=path)` prints each stage; it stops at the first wrong one.
    Each checkpoint runs a plan prefix (one `exec` process each), so keep the list short.
 
+## Memory check for a new op or plan (do this with step 3 and again with step 5)
+`check.guard_run(label, plan, arena, {'A': input}, writes=['O'], scratch=['TK'], weights=path)` returns `(ok, regions, problems)`.
+Comparing values alone misses a shader that also writes somewhere else, or one that reads leftovers of an earlier run.
+Run it once plain and once with `poison=True`; the values must be the same both times.
+
 ## Timing (step 6)
+For a whole plan use `gpuport.profile.profile(plan, arena_init, weights=path)`: any `gemm12`/`gemm12o4` row near 2 GMAC/s is a
+matmul still on the row-major path (pass `kscratch` to get about 5-6).
 `time_op(Plan([...]), arena, out_off, out_n, repeats=20)`. Change one thing at a time, re-run the per-op test after each change.
 
 ## Rules built into the kit (source: `<notes>/2026-11-03-gpu-porting-rules.md`)
@@ -85,6 +100,7 @@ Config (`gpuport/config.py`) can be overridden with env vars: `GPUPORT_SHADERS` 
 | push constants <= 32 words | `Op` raises; `lint()` |
 | plan local size must equal the shader's `local_size_x` literal | `lint()` error (reads `<name>.comp`) |
 | arena fits exec batch buffer (8M floats) and weights (32M floats) | `Arena` limit, `run()` check |
+| power-of-two row stride (>= 512) on a row-major matmul: 7x slower | `lint()` warning |
 | signed positions, vec4 alignment, no 64-way shared reductions | not checkable by the kit; see the rules note |
 
 ## nemo8 proof and speed

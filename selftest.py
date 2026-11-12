@@ -96,6 +96,15 @@ def test_bisect_and_lint():
     allok &= any('local' in e for e in errs)
 
 
+    # lint must warn about a power-of-two row stride on a row-major matmul (7x slower at 512, GPU_MAP section 10)
+    w = Weights(); mm = w.put_mm(np.zeros((12, 512), np.float32))
+    slow = ops.gemm12(Plan(), 0, 8, mm, 600000, sAm=512)
+    fine = ops.gemm12(Plan(), 0, 8, mm, 600000, sAm=516)
+    hit = any('power-of-two' in m for _, m in slow.lint(SHADER_DIR)) and not any('power-of-two' in m for _, m in fine.lint(SHADER_DIR))
+    print('lint warns about a 512 row stride (and not 516):', hit)
+    allok &= hit
+
+
 def test_timing():
     n = 16384
     ar = Arena(); a = ar.alloc('a', n); b = ar.alloc('b', n)

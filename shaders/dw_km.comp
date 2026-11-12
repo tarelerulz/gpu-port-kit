@@ -1,0 +1,24 @@
+#version 450
+// Depthwise conv over time on k-major data (2026-11-12): in[c][t], out[c][t], rows of pitch TP (frames contiguous).
+// out = act(b[c] + sum_j w[j][c] * in[c][t + j - k/2]), zero outside [0, T). Weights [k][d] as for dw4.
+// One invocation per (c, t): neighbouring threads read neighbouring frames of the same channel.
+// u: 0 T, 1 d, 2 k, 3 TP, 4 in, 5 out, 6 w, 7 bias, 8 act (0 none, 1 silu)
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint T = p.u[0], d = p.u[1], k = p.u[2], TP = p.u[3];
+    if (idx >= d * TP) return;
+    uint c = idx / TP, t = idx % TP;
+    if (t >= T) return;
+    int h = int(k / 2u), row = int(p.u[4] + c * TP);
+    float acc = w[p.u[7] + c];
+    for (uint j = 0u; j < k; j++) {
+        int s = int(t) + int(j) - h;
+        if (s >= 0 && s < int(T)) acc += w[p.u[6] + j * d + c] * a[row + s];
+    }
+    if (p.u[8] == 1u) acc = acc / (1.0 + exp(-acc));
+    a[p.u[5] + idx] = acc;
+}

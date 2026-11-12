@@ -69,6 +69,7 @@ def build(Tm, n, nrows, zero_row, fe, sc, d, av4=None):
     ops.gemm12(p, PAT, T3 * 20, fe['c2'], C2, K=sc * 9, N=sc, sAm=sc * 9, epi=3, kscratch=R.get('TK'))
     p.dispatch('fe_flat', 64, T3 * sc * 20, [T3, sc, C2, FL])
     ops.gemm12(p, FL, T3, fe['sub'], X, K=sc * 20, N=d, sAm=sc * 20, kscratch=R.get('TK'))
+    p.arena = ar          # region sizes, for check.guard_run (tests/stream_guard.py)
     return p, R, T3, n
 
 

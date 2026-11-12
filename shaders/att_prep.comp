@@ -1,0 +1,22 @@
+#version 450
+// Attention inputs in k-major form (2026-11-12): for each column c of the model width and each frame i,
+//   QU[c][i] = (q[i][c] + pbu[c]) * scale, QV[c][i] = (q[i][c] + pbv[c]) * scale, KT[c][i] = k[i][c]
+// rows of pitch TP (frames contiguous, zero past T). qkv rows are [q | k | v], each d wide.
+// u: 0 T, 1 d, 2 dh, 3 TP, 4 qkv, 5 QU, 6 QV, 7 KT, 8 pbu (weights), 9 pbv (weights)
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint T = p.u[0], d = p.u[1], TP = p.u[3], idx = gl_GlobalInvocationID.x;
+    if (idx >= d * TP) return;
+    uint c = idx / TP, i = idx % TP;
+    float qu = 0.0, qv = 0.0, k = 0.0;
+    if (i < T) {
+        float scale = 1.0 / sqrt(float(p.u[2]));
+        float q = a[p.u[4] + i * 3u * d + c];
+        qu = (q + w[p.u[8] + c]) * scale; qv = (q + w[p.u[9] + c]) * scale;
+        k = a[p.u[4] + i * 3u * d + d + c];
+    }
+    a[p.u[5] + idx] = qu; a[p.u[6] + idx] = qv; a[p.u[7] + idx] = k;
+}

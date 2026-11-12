@@ -1,0 +1,18 @@
+#version 450
+// conv0 output planes PL[f0h][dt][ch][t3] (pitch TP): put the zero padding conv2 expects (2026-11-12).
+// f0h = 0 and 41 are padding columns (whole rows zero); plane dt holds conv0 row t2 = 2*t3 + dt - 1, which does not
+// exist for (dt 0, t3 0) and, when T2 is odd, for (dt 2, t3 T3-1).
+// u: 0 T3, 1 T2, 2 sc, 3 TP, 4 PL
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint idx = gl_GlobalInvocationID.x, T3 = p.u[0], T2 = p.u[1], sc = p.u[2], TP = p.u[3];
+    if (idx >= 42u * 3u * sc) return;
+    uint dt = (idx / sc) % 3u, f0h = idx / (3u * sc);
+    uint row = p.u[4] + idx * TP;
+    if (f0h == 0u || f0h == 41u) { for (uint t = 0u; t < TP; t++) a[row + t] = 0.0; return; }
+    if (dt == 0u) a[row] = 0.0;
+    if (dt == 2u && 2u * T3 - 1u >= T2) a[row + T3 - 1u] = 0.0;
+    for (uint t = T3; t < TP; t++) a[row + t] = 0.0;      // padding frames
+}
