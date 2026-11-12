@@ -118,12 +118,12 @@ def prepare(nr, model=MODEL, int8=False, pos_cache=True):
     if pos_cache and not int8 and os.environ.get('GPUPORT_ASM') == '1':     # QPU kernel weights (f16 pairs), appended
         asm = [{k_: put_asm(w, L_[k_]) for k_ in ASM_KEYS} for L_ in layers]
         if fe2:
-            asm.append(dict(c2=put_asm(w, ('f32', W2, c2_b))))          # last entry: conv2 (K = 9 sc, relu)
+            asm.append(dict(c2=put_asm(w, ('f32', W2, c2_b)), sub=put_asm(w, ('f32', sub_W * np.sqrt(d), sub_b * np.sqrt(d)))))   # last entry: conv2 (K = 9 sc, relu) and the subsampling matmul
         w.put(np.zeros(16, np.float32))
     return w, dict(d=d, H=H, ff=ff, k=k, nl=nl, sc=sc, V=V, f2=f2, fe=fe, layers=lay, head=head, tokens=toks, int8=int8, pos_tab=pos_tab, fe2=fe2, fe3=fe3, asm=asm)
 
 
-ASM_KEYS = ('ff1_1', 'ff2_1', 'ff1_2', 'ff2_2', 'out', 'pw2')   # matmuls run by the hand-written QPU kernel (GPUPORT_ASM=1, exec_hybrid runner)
+ASM_KEYS = ('ff1_1', 'ff2_1', 'ff1_2', 'ff2_2', 'out', 'pw2', 'qkv', 'pw1')   # matmuls run by the hand-written QPU kernel (GPUPORT_ASM=1, exec_hybrid runner)
 
 
 def put_asm(w, x):
@@ -209,7 +209,7 @@ def _build(n, L, optimized=True, av4=None, att_km=None):
     fe2 = bool(km and L.get('fe2') and os.environ.get('GPUPORT_FE2', '1') != '0' and Tq >= FE2_MIN_T)
     # fe3 (2026-11-12): the DFT as two small matmuls (16 x 32) instead of two dense 512 x 257 ones; GPUPORT_FE3=0 = dense DFT
     fe3 = bool(fe2 and L.get('fe3') and os.environ.get('GPUPORT_FE3', '1') != '0')
-    use_asm = bool(L.get('asm')) and os.environ.get('GPUPORT_ASM') == '1' and 200 <= T <= 256 and km
+    use_asm = bool(L.get('asm')) and os.environ.get('GPUPORT_ASM') == '1' and 1 <= T <= 256 and km and not 129 <= T <= 160
     Tk = Tp if km else T                     # frames per row of the layer regions
     FRS = 516 if optimized else 512          # padded frame row stride (512 was 7x slower in the DFT matmul)
     ar = Arena(limit=ARENA_FLOATS)
@@ -280,7 +280,10 @@ def _build(n, L, optimized=True, av4=None, att_km=None):
         else:
           for f in range(20):
             ops.gemm_km(p, PL + 2 * f * 3 * sc * Tp, T3, Tp, L['fe2']['c2p'], FLK + f * Tp, 20 * Tp, epi=3)
-        ops.gemm_km(p, FLK, T3, Tp, fe['sub'], X, Tp)
+        if use_asm and os.environ.get('GPUPORT_ASM_CONV', '1') == '1':
+            ops.asm_mm(p, FLK, T3, Tp, L['asm'][-1]['sub'], X, Tp)
+        else:
+            ops.gemm_km(p, FLK, T3, Tp, fe['sub'], X, Tp)
     else:
         _fe_old(p, R, L, fe, optimized, km, Tm, T2, T3, Tp, sc, d, MEL, X)
     if not pos_cache:
@@ -311,6 +314,16 @@ def _build(n, L, optimized=True, av4=None, att_km=None):
             ops.silu(p, lw_[key_]['n'] * Tp, H2, H2)
         else:
             ops.gemm_km(p, HB, T, Tp, lw_[key_], H2, Tp, epi=2)
+    def ASMROW(lw_, key_, li_, out_, ncols_):    # matmul with a row-major [T][ncols] output (qkv)
+        if use_asm and os.environ.get('GPUPORT_ASM_ROW', '1') == '1':
+            ops.asm_mm_rm(p, HB, T, Tp, L['asm'][li_][key_], out_, ncols_)
+        else:
+            ops.gemm_km(p, HB, T, Tp, lw_[key_], out_)
+    def ASMPLAIN(lw_, key_, li_, out_):          # k-major output, bias only (pw1)
+        if use_asm and os.environ.get('GPUPORT_ASM_ROW', '1') == '1':
+            ops.asm_mm(p, HB, T, Tp, L['asm'][li_][key_], out_, Tp)
+        else:
+            ops.gemm_km(p, HB, T, Tp, lw_[key_], out_, Tp)
     def ASMRS(lw_, key_, li_, src_, scale_):   # matmul with the residual folded in (X += scale * result)
         if use_asm and os.environ.get('GPUPORT_ASM_RS', '1') == '1':
             ops.asm_mm_rs(p, src_, T, Tp, L['asm'][li_][key_], X, Tp, scale_)
@@ -324,10 +337,10 @@ def _build(n, L, optimized=True, av4=None, att_km=None):
             G = ops.gemm_km; n_ = d * Tp
             ops.ln_km(p, T, d, Tp, X, HB, lw['n_ff1']); ASMFF(lw, 'ff1_1', li)
             ASMRS(lw, 'ff1_2', li, H2, 0.5)
-            ops.ln_km(p, T, d, Tp, X, HB, lw['n_att']); G(p, HB, T, Tp, lw['qkv'], QKV)
+            ops.ln_km(p, T, d, Tp, X, HB, lw['n_att']); ASMROW(lw, 'qkv', li, QKV, 3 * d)
             ops.attention_km(p, T, d, H, QKV, PE, lw['pos'], lw['pbu'], lw['pbv'], ATT, R, pos_tab=tab, att_pitch=Tp)
             ASMRS(lw, 'out', li, ATT, 1.0)
-            ops.ln_km(p, T, d, Tp, X, HB, lw['n_conv']); G(p, HB, T, Tp, lw['pw1'], H2, Tp)
+            ops.ln_km(p, T, d, Tp, X, HB, lw['n_conv']); ASMPLAIN(lw, 'pw1', li, H2)
             if k <= 33:
                 ops.glu_dw_km(p, T, d, k, Tp, H2, GL, CV, lw['dw_w'], lw['dw_b'], act=1)
             else:

@@ -264,6 +264,13 @@ def asm_mm_rs(plan, a_off, M, a_pitch, asm, out_off, out_pitch, scale):
     return plan
 
 
+def asm_mm_rm(plan, a_off, M, a_pitch, asm, out_off, row_pitch):
+    """Like asm_mm but the output is row-major [m][n] with row pitch row_pitch floats (qpu_mm.kernel_rm); for matmuls whose consumer reads rows."""
+    assert M <= 256
+    plan.add('qpu_mmrm', 256, 1, 1, [asm['k'], asm['ntiles'], a_off, a_pitch, out_off, row_pitch, asm['wo'], asm['tile_words'], M])
+    return plan
+
+
 def gemm_to_km(plan, a_off, M, mm, out, out_pitch, kscratch, sAm=None, epi=0):
     """Row-major input (transposed through kscratch) -> k-major output. For the step that enters the k-major layers."""
     N, K, NP = mm['n'], mm['k'], mm['np']

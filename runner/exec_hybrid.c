@@ -218,14 +218,24 @@ int main(int argc, char **argv) {
             } else if (is_asm && h_prev) { h_in = h_prev; h_prev = 0; made_in = 1; }   /* two asm jobs in a row: chain on the previous out syncobj */
             if (!is_asm) { if (i == nops && i == i0) { fprintf(stderr, "plan must end with a Vulkan op\n"); exit(1); } break; }
             /* ---- asm job ---- */
-            uint32_t *pu = &ubo[nasm * 16]; uint32_t *q = ops[i].push;
+            uint32_t *pu = &ubo[nasm * 128]; uint32_t *q = ops[i].push;      /* 512-byte block: 16 parameter words, then the 8-thread work table at +64 B */
             uint32_t PI = q[3] * 4, OP = q[5] * 4;
             pu[0] = vaA + q[2] * 4; pu[1] = PI; pu[2] = PI + 64; pu[3] = 2 * PI; pu[4] = 64; pu[5] = vaA + q[4] * 4; pu[6] = OP; pu[7] = OP - 64; pu[8] = 16 * OP;
-            pu[9] = vaW + q[6] * 4; pu[10] = q[7] * 4; pu[11] = q[0] / 2; pu[12] = q[1]; pu[13] = q[8]; pu[14] = q[9];
+            pu[9] = vaW + q[6] * 4; pu[10] = q[7] * 4; pu[11] = q[0] / 2; pu[14] = q[9]; pu[13] = 0;
+            {   /* per-thread table: [m block base, first tile group, tile groups, tiles, valid m, 0, 0, 0]; blocks of 32 rows, 8 // nblk tile groups */
+                uint32_t M = q[8], NTl = q[1], nblk = (M + 31) / 32; if (nblk < 1) nblk = 1; if (nblk > 8) { fprintf(stderr, "M > 256\n"); exit(1); }
+                uint32_t G = 8 / nblk; uint32_t *tb = pu + 16;
+                for (uint32_t t = 0; t < 8; t++) {
+                    int ntl = (t < G * nblk) ? (int)((NTl - t / nblk + G - 1) / G) : 0; if (t / nblk >= NTl) ntl = 0;
+                    if (ntl <= 0) { uint32_t idle[8] = {0, 0, 1, 1, 0, 0, 0, 0}; memcpy(tb + t * 8, idle, 32); }
+                    else { uint32_t row[8] = { (t % nblk) * 32, t / nblk, G, (uint32_t)ntl, M, 0, 0, 0 }; memcpy(tb + t * 8, row, 32); }
+                }
+                pu[12] = vaC + 131072 + nasm * 512 + 64;
+            }
             int img = !strcmp(ops[i].name, "qpu_mmrs") ? 1 : !strcmp(ops[i].name, "qpu_mmrelu") ? 2 : !strcmp(ops[i].name, "qpu_mmrm") ? 3 : 0;
             if (img == 3) { pu[6] = OP; pu[7] = 4 - 16 * OP; pu[8] = 64; pu[14] = 16 * OP; }   /* row-major output: row bytes, step after odd acc, tile step, 16 rows */
             uint32_t h_out = syncobj_new();
-            csd_submit(vaC + img * 32768, vaC + 131072 + nasm * 64, h_in, h_out);
+            csd_submit(vaC + img * 32768, vaC + 131072 + nasm * 512, h_in, h_out);
             if (made_in) syncobj_free(h_in);
             h_prev = h_out; nasm++; i0 = i + 1;
         }

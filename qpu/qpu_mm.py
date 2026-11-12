@@ -22,6 +22,8 @@ ACC = [_R["rf%d" % i] for i in range(NA)]
 (WADDR, WT, KP, NT, KCNT, TCNT, LANE, ABASE, MV, LM) = [_R["rf%d" % i] for i in range(43, 53)]
 XSET = [(_R["r0"], _R["r1"]), (_R["r2"], _R["r4"])]
 RSC = _R['rf53']                                  # residual scale (rs kernel)
+SE = _R['rf54']                                   # row-major kernel: 16 * row bytes
+GG, GN = _R['rf55'], _R['rf56']                   # adaptive partition: this thread's first tile group / number of tile groups
 NPARAM = 14
 
 
@@ -52,22 +54,42 @@ def emit_block(s, odd, lk=None):
             sub(KCNT, KCNT, 1, cond='pushz')
 
 
-def make_kernel(rs, relu=False):
+def make_kernel(rs, relu=False, rm=False):
     @qpu
     def kernel(asm):
-        for reg in [ABASE, PI, PI64, PI2, C64, OB, OP, OS2, OTILE, WADDR, WT, KP, NT, MV] + ([RSC] if rs else []):
+        for reg in [ABASE, PI, PI64, PI2, C64, OB, OP, OS2, OTILE, WADDR, WT, KP, NT, MV] + ([RSC] if rs else []) + ([SE] if rm else []):
             nop(sig=ldunifrf(reg))
+        # per-thread table (8 words per thread at address NT = param 12): m block base, first tile group g, tile groups G, tiles, valid m
         tidx(r0)
         shr(r0, r0, 2)
         band(r0, r0, 0b1111)
         shl(r0, r0, 5)
+        add(r0, r0, NT)
+        mov(unifa, r0)
+        nop()
+        nop()
+        nop()
+        nop(sig=ldunifarf(LM))
+        nop(sig=ldunifarf(GG))
+        nop(sig=ldunifarf(GN))
+        nop(sig=ldunifarf(TCNT))
+        nop(sig=ldunifarf(MV))
         eidx(r1)
-        add(LM, r0, r1)                                   # m of lane (vector 0)
+        add(LM, LM, r1)                                   # m of lane (vector 0)
         shl(LANE, LM, 2)
-        add(OB, OB, LANE)
+        if rm:
+            umul24(r0, LM, OP)                            # row-major output: lane m starts at m * row bytes
+            add(OB, OB, r0)
+        else:
+            add(OB, OB, LANE)
         add(ABASE, ABASE, LANE)
+        umul24(r0, GG, WT)
+        add(WADDR, WADDR, r0)                             # this thread starts at tile g ...
+        umul24(r0, GG, OTILE)
+        add(OB, OB, r0)
+        umul24(WT, WT, GN)                                # ... and steps by G tiles
+        umul24(OTILE, OTILE, GN)
         mov(Z, 0)
-        mov(TCNT, NT)
         nop(sig=thrsw)
         nop()
         nop()
@@ -121,7 +143,7 @@ def make_kernel(rs, relu=False):
                     else:
                         mov(tmud, ACC[j])
                     mov(tmua, OCUR, cond='ifa' if j % 2 == 0 else 'ifb')
-                    add(OCUR, OCUR, C64 if j % 2 == 0 else OS2)
+                    add(OCUR, OCUR, (SE if rm else C64) if j % 2 == 0 else OS2)
                     tmuwt()
             add(OB, OB, OTILE)
             sub(TCNT, TCNT, 1, cond='pushz')
@@ -149,6 +171,32 @@ def make_kernel(rs, relu=False):
 kernel = make_kernel(False)
 kernel_rs = make_kernel(True)
 kernel_relu = make_kernel(False, True)
+kernel_rm = make_kernel(False, False, True)
+
+
+def use_render_node():
+    import _videocore6.driver as D
+    if not getattr(D, '_patched', False):
+        _o = D.DRM_V3D
+        D.DRM_V3D = lambda *a, **k: _o('/dev/dri/renderD128')     # works even while a Vulkan process holds card0
+        D._patched = True
+
+
+def make_table(M, NT, nthreads=8):
+    """Per-thread work table (8 words each): [m block base, first tile group g, tile groups G, tiles, valid m, 0, 0, 0].
+    nblk = ceil(M / 32) row blocks of 32 (1 .. 8); G = 8 // nblk tile groups share the n tiles; leftover threads idle (one masked tile)."""
+    nblk = max(1, (M + 31) // 32)
+    assert nblk <= nthreads
+    G = nthreads // nblk
+    tab = np.zeros((nthreads, 8), np.uint32)
+    for t in range(nthreads):
+        mb, g = t % nblk, t // nblk
+        ntl = (NT - g + G - 1) // G if t < G * nblk else 0
+        if ntl <= 0 or t >= G * nblk:
+            tab[t] = [0, 0, 1, 1, 0, 0, 0, 0]
+        else:
+            tab[t] = [mb * 32, g, G, ntl, M, 0, 0, 0]
+    return tab
 
 
 def pack_weights(W, bias):
@@ -163,7 +211,7 @@ def pack_weights(W, bias):
 
 
 def build(path):
-    for k_, p_ in ((kernel, path), (kernel_rs, path.replace('.qpu', 'rs.qpu')), (kernel_relu, path.replace('.qpu', 'relu.qpu'))):
+    for k_, p_ in ((kernel, path), (kernel_rs, path.replace('.qpu', 'rs.qpu')), (kernel_relu, path.replace('.qpu', 'relu.qpu')), (kernel_rm, path.replace('.qpu', 'rm.qpu'))):
         code = np.array(assemble(k_), dtype=np.uint64)
         code.tofile(p_)
         print(f'{len(code)} instructions -> {p_}')
@@ -171,8 +219,10 @@ def build(path):
 
 def test():
     import time
+    use_render_node()
     from videocore6.driver import Driver
-    K, N, M, TP = 176, 704, 251, 252
+    K, N, TP = 176, 704, 252
+    M = int(sys.argv[2]) if len(sys.argv) > 2 else 251
     rng = np.random.default_rng(5)
     Wm = (rng.standard_normal((N, K)) * 0.05).astype(np.float32)
     bias = (rng.standard_normal(N) * 0.1).astype(np.float32)
@@ -191,6 +241,7 @@ def test():
         Ws = drv.alloc((stream.size + 16,), dtype=np.uint32); Ws[:stream.size] = stream
         u = [A.addresses()[0], TP * 4, TP * 4 + 64, 2 * TP * 4, 64, O.addresses()[0], TP * 4, TP * 4 - 64, 16 * TP * 4,
              Ws.addresses()[0], tile_words * 4, K // 2, N // 16, M]
+        TB = drv.alloc((8, 8), dtype=np.uint32); TB[:] = make_table(M, N // 16); u[12] = TB.addresses()[0, 0]; u[13] = 0
         unif = drv.alloc(len(u) + 2, dtype=np.uint32); unif[:len(u)] = np.array(u, dtype=np.uint64).astype(np.uint32)
         for rep in range(3):
             t0 = time.monotonic()
@@ -206,6 +257,7 @@ def test():
 
 def test_rs():
     import time
+    use_render_node()
     from videocore6.driver import Driver
     TP, M = 252, 251
     rng = np.random.default_rng(6)
@@ -226,6 +278,7 @@ def test_rs():
             Ws = drv.alloc((stream.size + 16,), dtype=np.uint32); Ws[:stream.size] = stream
             u = [A.addresses()[0], TP * 4, TP * 4 + 64, 2 * TP * 4, 64, O.addresses()[0], TP * 4, TP * 4 - 64, 16 * TP * 4,
                  Ws.addresses()[0], (16 + 8 * K) * 4, K // 2, N // 16, M, int(np.float32(scale).view(np.uint32))]
+            TB = drv.alloc((8, 8), dtype=np.uint32); TB[:] = make_table(M, N // 16); u[12] = TB.addresses()[0, 0]; u[13] = 0
             unif = drv.alloc(len(u) + 2, dtype=np.uint32); unif[:len(u)] = np.array(u, dtype=np.uint64).astype(np.uint32)
             for rep in range(3):
                 O[:N * TP] = X0.reshape(-1)
