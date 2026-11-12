@@ -4,6 +4,7 @@
 // segments around it by explicit sync files (Vulkan SYNC_FD semaphore -> DRM syncobj -> CSD job -> sync file -> Vulkan semaphore).
 // usage: exec_hybrid weights.bin mm16.qpu [mm16rs.qpu [mm16relu.qpu [mm16rm.qpu]]] < requests      (same request protocol as exec_server2)
 // qpu_mm push words: 0 K, 1 ntiles, 2 A_off, 3 A_pitch, 4 O_off, 5 O_pitch (floats), 6 W_off (floats in the weights buffer), 7 tile_words, 8 M
+// push 10 = 1: the weight stream is in the arena (qpu_pack output) instead of the weights buffer
 // qpu_mmrs: same, plus 9 = float bits of the scale: out += scale * (acc + bias) (second code image at +32 KB); qpu_mmrelu: relu epilogue, no bias-free change (third image at +64 KB); qpu_mmrm: output row-major [m][n] with row pitch push[5] floats (fourth image at +96 KB)
 // Resident GPU server (exec_server2) for the Pi 400 V3D Vulkan path. Copyright (c) 2026 gpu-port-kit contributors. See LICENSE.
 // Run a plan of compute dispatches in one command buffer with a barrier after each.
@@ -221,14 +222,20 @@ int main(int argc, char **argv) {
             uint32_t *pu = &ubo[nasm * 128]; uint32_t *q = ops[i].push;      /* 512-byte block: 16 parameter words, then the 8-thread work table at +64 B */
             uint32_t PI = q[3] * 4, OP = q[5] * 4;
             pu[0] = vaA + q[2] * 4; pu[1] = PI; pu[2] = PI + 64; pu[3] = 2 * PI; pu[4] = 64; pu[5] = vaA + q[4] * 4; pu[6] = OP; pu[7] = OP - 64; pu[8] = 16 * OP;
-            pu[9] = vaW + q[6] * 4; pu[10] = q[7] * 4; pu[11] = q[0] / 2; pu[14] = q[9]; pu[13] = 0;
-            {   /* per-thread table: [m block base, first tile group, tile groups, tiles, valid m, 0, 0, 0]; blocks of 32 rows, 8 // nblk tile groups */
-                uint32_t M = q[8], NTl = q[1], nblk = (M + 31) / 32; if (nblk < 1) nblk = 1; if (nblk > 8) { fprintf(stderr, "M > 256\n"); exit(1); }
-                uint32_t G = 8 / nblk; uint32_t *tb = pu + 16;
-                for (uint32_t t = 0; t < 8; t++) {
-                    int ntl = (t < G * nblk) ? (int)((NTl - t / nblk + G - 1) / G) : 0; if (t / nblk >= NTl) ntl = 0;
-                    if (ntl <= 0) { uint32_t idle[8] = {0, 0, 1, 1, 0, 0, 0, 0}; memcpy(tb + t * 8, idle, 32); }
-                    else { uint32_t row[8] = { (t % nblk) * 32, t / nblk, G, (uint32_t)ntl, M, 0, 0, 0 }; memcpy(tb + t * 8, row, 32); }
+            pu[9] = (q[10] ? vaA : vaW) + q[6] * 4;     /* push 10: weight stream lives in the arena (packed activations) */ pu[10] = q[7] * 4; pu[11] = q[0] / 2; pu[14] = q[9]; pu[13] = 0;
+            {   /* per-thread table: [m block base, first tile group, tile groups, tiles, valid m, passes, 0, 0]; blocks of 32 rows.
+                   nblk <= 8: 8 // nblk tile groups share the n tiles; nblk > 8: every thread owns block t and repeats for passes of 256 rows */
+                uint32_t M = q[8], NTl = q[1], nblk = (M + 31) / 32; if (nblk < 1) nblk = 1; uint32_t *tb = pu + 16;
+                if (nblk > 8) {
+                    uint32_t P = (nblk + 7) / 8; if (P > 4) { fprintf(stderr, "M too large\n"); exit(1); }
+                    for (uint32_t t = 0; t < 8; t++) { uint32_t row[8] = { t * 32, 0, 1, NTl, M, P, 0, 0 }; memcpy(tb + t * 8, row, 32); }
+                } else {
+                    uint32_t G = 8 / nblk;
+                    for (uint32_t t = 0; t < 8; t++) {
+                        int ntl = (t < G * nblk) ? (int)((NTl - t / nblk + G - 1) / G) : 0; if (t / nblk >= NTl) ntl = 0;
+                        if (ntl <= 0) { uint32_t idle[8] = {0, 0, 1, 1, 0, 1, 0, 0}; memcpy(tb + t * 8, idle, 32); }
+                        else { uint32_t row[8] = { (t % nblk) * 32, t / nblk, G, (uint32_t)ntl, M, 1, 0, 0 }; memcpy(tb + t * 8, row, 32); }
+                    }
                 }
                 pu[12] = vaC + 131072 + nasm * 512 + 64;
             }

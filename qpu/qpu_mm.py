@@ -23,7 +23,8 @@ ACC = [_R["rf%d" % i] for i in range(NA)]
 XSET = [(_R["r0"], _R["r1"]), (_R["r2"], _R["r4"])]
 RSC = _R['rf53']                                  # residual scale (rs kernel)
 SE = _R['rf54']                                   # row-major kernel: 16 * row bytes
-GG, GN = _R['rf55'], _R['rf56']                   # adaptive partition: this thread's first tile group / number of tile groups
+GG, GN = _R['rf55'], _R['rf56']
+PASS, WSAVE, TCNT0, OBS = [_R['rf%d' % i] for i in range(57, 61)]   # passes over extra row blocks (M > 256) and the values to restore each pass                   # adaptive partition: this thread's first tile group / number of tile groups
 NPARAM = 14
 
 
@@ -74,6 +75,7 @@ def make_kernel(rs, relu=False, rm=False):
         nop(sig=ldunifarf(GN))
         nop(sig=ldunifarf(TCNT))
         nop(sig=ldunifarf(MV))
+        nop(sig=ldunifarf(PASS))                          # table word 5: passes over blocks of 256 rows
         eidx(r1)
         add(LM, LM, r1)                                   # m of lane (vector 0)
         shl(LANE, LM, 2)
@@ -89,65 +91,87 @@ def make_kernel(rs, relu=False, rm=False):
         add(OB, OB, r0)
         umul24(WT, WT, GN)                                # ... and steps by G tiles
         umul24(OTILE, OTILE, GN)
+        mov(WSAVE, WADDR)
+        mov(TCNT0, TCNT)
+        mov(OBS, OB)
         mov(Z, 0)
         nop(sig=thrsw)
         nop()
         nop()
 
-        with loop as lt:                                  # over n tiles
-            mov(unifa, WADDR)
-            add(WADDR, WADDR, WT)
-            mov(KCNT, KP)
-            add(tmua, ABASE, Z)                           # x requests for k = 0 and k = 1
-            add(tmua, ABASE, C64)
-            add(P0, ABASE, PI)
-            add(tmua, P0, Z)
-            add(tmua, P0, C64)
-            add(P0, P0, PI)                               # P0 = k 2
-            mov(r3, 0.0)
-            nop(sig=ldtmu(r0))
-            nop(sig=ldtmu(r1))
-            nop()
-            nop(sig=ldunifa)                              # bias 0 -> r5
-            for n in range(16):                           # accumulators start at the bias; the last signal fetches weight pair 0
-                mov(ACC[2 * n], r5, sig=ldunifa).mov(ACC[2 * n + 1], r5)
+        with loop as lp:                                  # over blocks of 256 rows (normally one pass)
+            with loop as lt:                                  # over n tiles
+                mov(unifa, WADDR)
+                add(WADDR, WADDR, WT)
+                mov(KCNT, KP)
+                add(tmua, ABASE, Z)                           # x requests for k = 0 and k = 1
+                add(tmua, ABASE, C64)
+                add(P0, ABASE, PI)
+                add(tmua, P0, Z)
+                add(tmua, P0, C64)
+                add(P0, P0, PI)                               # P0 = k 2
+                mov(r3, 0.0)
+                nop(sig=ldtmu(r0))
+                nop(sig=ldtmu(r1))
+                nop()
+                nop(sig=ldunifa)                              # bias 0 -> r5
+                for n in range(16):                           # accumulators start at the bias; the last signal fetches weight pair 0
+                    mov(ACC[2 * n], r5, sig=ldunifa).mov(ACC[2 * n + 1], r5)
 
-            with loop as lk:
-                emit_block(0, False)
-                emit_block(1, True, lk)
+                with loop as lk:
+                    emit_block(0, False)
+                    emit_block(1, True, lk)
 
-            fadd(ACC[NA - 1], ACC[NA - 1], r3)
-            nop(sig=ldtmu(r0))
-            nop(sig=ldtmu(r1))
+                fadd(ACC[NA - 1], ACC[NA - 1], r3)
+                nop(sig=ldtmu(r0))
+                nop(sig=ldtmu(r1))
 
-            mov(r1, 1)
-            shl(r1, r1, 4)                                # 16 (small immediates stop at 15)
-            add(r0, LM, r1)                               # flags: A = vector 0 lanes with m < M, B = vector 1 lanes
-            sub(null, r0, MV, cond='pushn')
-            sub(null, LM, MV, cond='pushn')
-            mov(OCUR, OB)
-            if rs:
-                for j in range(NA):                       # out += scale * (acc incl. bias): read, multiply-add, store
-                    mov(tmua, OCUR)
-                    fmul(r3, ACC[j], RSC)
-                    nop(sig=ldtmu(r0))
-                    fadd(r1, r0, r3)
-                    mov(tmud, r1)
-                    mov(tmua, OCUR, cond='ifa' if j % 2 == 0 else 'ifb')
-                    add(OCUR, OCUR, C64 if j % 2 == 0 else OS2)
-                    tmuwt()
+                mov(r1, 1)
+                shl(r1, r1, 4)                                # 16 (small immediates stop at 15)
+                add(r0, LM, r1)                               # flags: A = vector 0 lanes with m < M, B = vector 1 lanes
+                sub(null, r0, MV, cond='pushn')
+                sub(null, LM, MV, cond='pushn')
+                mov(OCUR, OB)
+                if rs:
+                    for j in range(NA):                       # out += scale * (acc incl. bias): read, multiply-add, store
+                        mov(tmua, OCUR)
+                        fmul(r3, ACC[j], RSC)
+                        nop(sig=ldtmu(r0))
+                        fadd(r1, r0, r3)
+                        mov(tmud, r1)
+                        mov(tmua, OCUR, cond='ifa' if j % 2 == 0 else 'ifb')
+                        add(OCUR, OCUR, C64 if j % 2 == 0 else OS2)
+                        tmuwt()
+                else:
+                    for j in range(NA):
+                        if relu:
+                            fmax(tmud, ACC[j], 0.0)
+                        else:
+                            mov(tmud, ACC[j])
+                        mov(tmua, OCUR, cond='ifa' if j % 2 == 0 else 'ifb')
+                        add(OCUR, OCUR, (SE if rm else C64) if j % 2 == 0 else OS2)
+                        tmuwt()
+                add(OB, OB, OTILE)
+                sub(TCNT, TCNT, 1, cond='pushz')
+                lt.b(cond='anyna')
+                nop()
+                nop()
+                nop()
+            # next pass: 256 rows further
+            sub(PASS, PASS, 1, cond='pushz')
+            mov(WADDR, WSAVE)
+            mov(TCNT, TCNT0)
+            shl(r0, C64, 4)                                   # 1024 bytes = 256 floats
+            shl(r1, C64, 2)                                   # 256 rows
+            add(ABASE, ABASE, r0)
+            add(LM, LM, r1)
+            if rm:
+                umul24(r2, r1, OP)
+                add(OBS, OBS, r2)
             else:
-                for j in range(NA):
-                    if relu:
-                        fmax(tmud, ACC[j], 0.0)
-                    else:
-                        mov(tmud, ACC[j])
-                    mov(tmua, OCUR, cond='ifa' if j % 2 == 0 else 'ifb')
-                    add(OCUR, OCUR, (SE if rm else C64) if j % 2 == 0 else OS2)
-                    tmuwt()
-            add(OB, OB, OTILE)
-            sub(TCNT, TCNT, 1, cond='pushz')
-            lt.b(cond='anyna')
+                add(OBS, OBS, r0)
+            mov(OB, OBS)
+            lp.b(cond='anyna')
             nop()
             nop()
             nop()
@@ -183,19 +207,24 @@ def use_render_node():
 
 
 def make_table(M, NT, nthreads=8):
-    """Per-thread work table (8 words each): [m block base, first tile group g, tile groups G, tiles, valid m, 0, 0, 0].
-    nblk = ceil(M / 32) row blocks of 32 (1 .. 8); G = 8 // nblk tile groups share the n tiles; leftover threads idle (one masked tile)."""
+    """Per-thread work table (8 words each): [m block base, first tile group g, tile groups G, tiles, valid m, passes, 0, 0].
+    nblk = ceil(M / 32) row blocks of 32. nblk <= 8: G = 8 // nblk tile groups share the n tiles, leftover threads idle (one masked tile).
+    nblk > 8: every thread owns block t and repeats for passes of 256 rows (blocks t + 8 p)."""
     nblk = max(1, (M + 31) // 32)
-    assert nblk <= nthreads
-    G = nthreads // nblk
     tab = np.zeros((nthreads, 8), np.uint32)
+    if nblk > nthreads:
+        P = (nblk + nthreads - 1) // nthreads
+        for t in range(nthreads):
+            tab[t] = [t * 32, 0, 1, NT, M, P, 0, 0]
+        return tab
+    G = nthreads // nblk
     for t in range(nthreads):
         mb, g = t % nblk, t // nblk
         ntl = (NT - g + G - 1) // G if t < G * nblk else 0
         if ntl <= 0 or t >= G * nblk:
-            tab[t] = [0, 0, 1, 1, 0, 0, 0, 0]
+            tab[t] = [0, 0, 1, 1, 0, 1, 0, 0]
         else:
-            tab[t] = [mb * 32, g, G, ntl, M, 0, 0, 0]
+            tab[t] = [mb * 32, g, G, ntl, M, 1, 0, 0]
     return tab
 
 
@@ -221,8 +250,9 @@ def test():
     import time
     use_render_node()
     from videocore6.driver import Driver
-    K, N, TP = 176, 704, 252
+    K, N = 176, 704
     M = int(sys.argv[2]) if len(sys.argv) > 2 else 251
+    TP = max(252, (M + 3) // 4 * 4)
     rng = np.random.default_rng(5)
     Wm = (rng.standard_normal((N, K)) * 0.05).astype(np.float32)
     bias = (rng.standard_normal(N) * 0.1).astype(np.float32)

@@ -128,11 +128,12 @@ BATCH = os.environ.get('GPUPORT_BATCH', '1') != '0'      # heads / column positi
 LOCAL = {'ln_km4': 256, 'dw_km4': 256, 'att_softmax_t4': 128, 'tr_km': 256, 'att_prep': 256, 'att_comb': 256, 'glu_kmh': 256}
 
 
-def att_km_regions(T, d, H, pos=True):
+def att_km_regions(T, d, H, pos=True, qpu=False):
     """(name, floats) of the extra arena regions attention_km needs. TK (transpose scratch) must hold d * 252."""
     TP = (T + 11) // 12 * 12; NPr = 2 * T - 1; PTP = (NPr + 11) // 12 * 12
     return [('QU', d * TP), ('QV', d * TP), ('KT', d * TP)] + ([('PT', d * PTP)] if pos else []) + \
-        [('ST', H * T * TP), ('GT', H * (NPr + 3) * TP)]      # pos=False: position table comes from the weights
+        [('ST', H * T * TP), ('GT', H * (NPr + 3) * TP)] + \
+        ([('PK', H * max(((T + 15) // 16) * (16 + 8 * (d // H)), 3 * (16 + 8 * (T + (T & 1)))) + 64)] if qpu else [])      # pos=False: position table comes from the weights; PK: packed K / V for the QPU kernel
 
 
 def _g(threads, local=256):
@@ -153,7 +154,7 @@ def pos_table_km(Wpos, bpos, Tmax):
     return out, pitch
 
 
-def attention_km(plan, T, d, H, qkv, pe, mm_pos, pbu, pbv, att, R, pos=True, pos_tab=None, att_pitch=None, fused=True):
+def attention_km(plan, T, d, H, qkv, pe, mm_pos, pbu, pbv, att, R, pos=True, pos_tab=None, att_pitch=None, fused=True, qpu=False, pos_asm=None):
     """qkv: rows [q | k | v] (stride 3d). pe: positional table [2T-1][d]. mm_pos: put_mm of the pos projection.
     pbu, pbv: weight offsets. att: output [T][d]. R: region offsets with the att_km_regions names and 'TK'.
     Needs d % 4 == 0 and (d / H) % 4 == 0."""
@@ -178,7 +179,18 @@ def attention_km(plan, T, d, H, qkv, pe, mm_pos, pbu, pbv, att, R, pos=True, pos
     q4 = (T + 3) // 4
     NPg = (GR + 11) // 12 * 12
     name, wbase, wpitch = bd or ('gemm12wa1', PT, PTP)
-    if BATCH:      # heads in one dispatch (workgroup y); u[22] A stride, u[23] out stride, u[24] W stride (2026-11-12)
+    if qpu:        # scores on the QPU kernel: K^T packed to f16 tiles in the arena, one job per head (qpu_pack + qpu_mm, push 10 = 1)
+        PK = R['PK']; nts = (T + 15) // 16; tws = 16 + 8 * dh
+        plan.add('qpu_pack', 256, (nts * tws + 255) // 256, H, [dh, T, KT, TP, PK, nts, tws, dh * TP, nts * tws])
+        for h in range(H):
+            plan.add('qpu_mm', 256, 1, 1, [dh, nts, QU + h * dh * TP, TP, ST + h * T * TP, TP, PK + h * nts * tws, tws, T, 0, 1])
+        if pos_asm is not None and pos_tab is not None:       # position term from the static f16 tables (phase = window start mod 16)
+            phi, u0, ntp, twp = s4 % 16, s4 // 16, (GR + 15) // 16, 16 + 8 * dh
+            for h in range(H):
+                plan.add('qpu_mm', 256, 1, 1, [dh, ntp, QV + h * dh * TP, TP, GT + h * GR * TP, TP, pos_asm[phi // 4][h] + u0 * twp, twp, T, 0, 0])
+        else:
+            plan.add(name + 'b', 256, _g((NPg // 12) * q4), H, [T, GR, dh, NPg, QV, 1, TP, wbase, none, GT, 1, TP, 0] + [0] * 8 + [wpitch, dh * TP, GR * TP, dh * wpitch])
+    elif BATCH:      # heads in one dispatch (workgroup y); u[22] A stride, u[23] out stride, u[24] W stride (2026-11-12)
         plan.add('gemm12wa1b', 256, _g((TP // 12) * q4), H, [T, T, dh, TP, QU, 1, TP, KT, none, ST, 1, TP, 0] + [0] * 8 + [TP, dh * TP, T * TP, dh * TP])
         plan.add(name + 'b', 256, _g((NPg // 12) * q4), H, [T, GR, dh, NPg, QV, 1, TP, wbase, none, GT, 1, TP, 0] + [0] * 8 + [wpitch, dh * TP, GR * TP, dh * wpitch])
     else:
@@ -194,6 +206,12 @@ def attention_km(plan, T, d, H, qkv, pe, mm_pos, pbu, pbv, att, R, pos=True, pos
         plan.add('att_comb', LOCAL['att_comb'], _g(H * T * TP, LOCAL['att_comb']), 1, [T, H, TP, ST, GT, e, GR])
         plan.add('att_softmax_t', 64, _g(H * T, 64), 1, [T, H, TP, ST])
     NPv = (dh + 11) // 12 * 12
+    if qpu and att_pitch:       # attention x V on the QPU kernel: V packed per head, K = T rounded up to even (zero row), 3 tiles of 16 channels
+        PK = R['PK']; Kv = T + (T & 1); twv = 16 + 8 * Kv
+        plan.add('qpu_pack', 256, (3 * twv + 255) // 256, H, [T, dh, qkv + 2 * d, 3 * d, PK, 3, twv, dh, 3 * twv])
+        for h in range(H):
+            plan.add('qpu_mm', 256, 1, 1, [Kv, 3, ST + h * T * TP, TP, att + h * dh * att_pitch, att_pitch, PK + h * 3 * twv, twv, T, 0, 1])
+        return plan
     if BATCH and att_pitch:
         plan.add('gemm12wa1b', 256, _g((NPv // 12) * q4), H,
                  [T, dh, T, NPv, ST, 1, TP, qkv + 2 * d, none, att, 1, att_pitch, 0] + [0] * 8 + [3 * d, T * TP, dh * att_pitch, dh])
@@ -252,21 +270,21 @@ def asm_mm(plan, a_off, M, a_pitch, asm, out_off, out_pitch, relu=False):
     """Hand-written QPU matmul (exec_hybrid runner, work/asm/qpu_mm.py): out[n][m] = bias[n] + sum_k W[k][n] * A[k][m] for m < M <= 256,
     A / out k-major with the given row pitches (floats). asm = dict(wo, k, ntiles, tile_words) from nemo8.put_asm. Not a shader: the
     runner submits it as a raw CSD job. No activation (add a silu / relu op after it)."""
-    assert M <= 256
+    assert M <= 1024
     plan.add('qpu_mmrelu' if relu else 'qpu_mm', 256, 1, 1, [asm['k'], asm['ntiles'], a_off, a_pitch, out_off, out_pitch, asm['wo'], asm['tile_words'], M])
     return plan
 
 
 def asm_mm_rs(plan, a_off, M, a_pitch, asm, out_off, out_pitch, scale):
     """Like asm_mm but out += scale * (acc + bias) (the residual add folded in, qpu_mm.kernel_rs)."""
-    assert M <= 256
+    assert M <= 1024
     plan.add('qpu_mmrs', 256, 1, 1, [asm['k'], asm['ntiles'], a_off, a_pitch, out_off, out_pitch, asm['wo'], asm['tile_words'], M, fbits(scale)])
     return plan
 
 
 def asm_mm_rm(plan, a_off, M, a_pitch, asm, out_off, row_pitch):
     """Like asm_mm but the output is row-major [m][n] with row pitch row_pitch floats (qpu_mm.kernel_rm); for matmuls whose consumer reads rows."""
-    assert M <= 256
+    assert M <= 1024
     plan.add('qpu_mmrm', 256, 1, 1, [asm['k'], asm['ntiles'], a_off, a_pitch, out_off, row_pitch, asm['wo'], asm['tile_words'], M])
     return plan
 
