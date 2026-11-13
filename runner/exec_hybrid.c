@@ -103,9 +103,9 @@ static void drm_setup(Buf *A, Buf *W, int ncode, char **codepaths) {
     struct drm_v3d_mmap_bo mb = { .handle = hC }; DCK(ioctl(dfd, DRM_IOCTL_V3D_MMAP_BO, &mb));
     uint8_t *m = mmap(NULL, CODE_BO, PROT_READ | PROT_WRITE, MAP_SHARED, dfd, mb.offset); if (m == MAP_FAILED) { perror("mmap"); exit(1); }
     size_t n = 0;
-    for (int ci = 0; ci < ncode && ci < 5; ci++) {
+    for (int ci = 0; ci < ncode && ci < 11; ci++) {
         FILE *f = fopen(codepaths[ci], "rb"); if (!f) { fprintf(stderr, "no qpu code %s\n", codepaths[ci]); exit(1); }
-        n += fread(m + ci * 32768, 1, 32768, f); fclose(f);
+        n += ci < 6 ? fread(m + ci * 32768, 1, 32768, f) : fread(m + 196608 + (ci - 6) * 8192, 1, 8192, f); fclose(f);   /* ci >= 6: 4 x 8 tiling kernels (qpu_mm4.py) */
     }
     ubo = (uint32_t *)(m + 262144);
     fprintf(stderr, "qpu code %zu bytes at va 0x%x; arena va 0x%x weights va 0x%x\n", n, vaC, vaA, vaW);
@@ -184,7 +184,7 @@ int main(int argc, char **argv) {
         int ncb = 0, i0 = 0, need_wait = 0, nasm = 0; uint32_t h_prev = 0;
         CK(vkResetFences(dev, 1, &fence));
         for (int i = 0; i <= nops; i++) {
-            int is_asm = (i < nops) && (!strcmp(ops[i].name, "qpu_mm") || !strcmp(ops[i].name, "qpu_mmrs") || !strcmp(ops[i].name, "qpu_mmrelu") || !strcmp(ops[i].name, "qpu_mmrm") || !strcmp(ops[i].name, "qpu_mmsk"));
+            int is_asm = (i < nops) && (!strcmp(ops[i].name, "qpu_mm") || !strcmp(ops[i].name, "qpu_mmrs") || !strcmp(ops[i].name, "qpu_mmrelu") || !strcmp(ops[i].name, "qpu_mmrm") || !strcmp(ops[i].name, "qpu_mmsk") || !strcmp(ops[i].name, "qpu_mmsilu") || !strcmp(ops[i].name, "qpu_mmh") || !strcmp(ops[i].name, "qpu_mmskh") || !strncmp(ops[i].name, "qpu4_", 5));
             if (i < nops && !is_asm) continue;
             /* ---- Vulkan segment [i0, i) ---- */
             uint32_t h_in = 0; int made_in = 0;
@@ -219,6 +219,28 @@ int main(int argc, char **argv) {
             } else if (is_asm && h_prev) { h_in = h_prev; h_prev = 0; made_in = 1; }   /* two asm jobs in a row: chain on the previous out syncobj */
             if (!is_asm) { if (i == nops && i == i0) { fprintf(stderr, "plan must end with a Vulkan op\n"); exit(1); } break; }
             /* ---- asm job ---- */
+            if (!strncmp(ops[i].name, "qpu4_", 5)) {   /* 4 vectors x 8 columns kernel (qpu_mm4.py): k-major out, static weights in the weights buffer */
+                uint32_t *pu4 = &ubo[nasm * 128]; uint32_t *q4 = ops[i].push;
+                uint32_t K4 = q4[0], NTL = q4[1], M4 = q4[8], tw = q4[7];
+                uint32_t nblk = (M4 + 63) / 64; if (nblk < 1) nblk = 1; if (nblk > 8) { fprintf(stderr, "qpu4: M %u > 512\n", M4); exit(1); }
+                uint32_t G = 8 / nblk;
+                pu4[0] = q4[3] * 4; pu4[1] = q4[5] * 4; pu4[2] = tw * 4 * G; pu4[3] = 8 * G * q4[5] * 4; pu4[4] = K4 / 2; pu4[5] = vaC + 262144 + nasm * 512 + 64; pu4[6] = q4[9];
+                uint32_t *tb4 = pu4 + 16;
+                for (uint32_t t = 0; t < 8; t++) {
+                    uint32_t mb = t % nblk, g = t / nblk; int act = (t < G * nblk) && (g < NTL);
+                    if (!act) { mb = 0; g = 0; }
+                    uint32_t ntl = act ? (NTL - g + G - 1) / G : 1, v = act ? M4 - 64 * mb : 0;
+                    tb4[t * 8 + 0] = vaA + 4 * (q4[2] + 64 * mb); tb4[t * 8 + 1] = vaW + 4 * (q4[6] + g * tw);
+                    tb4[t * 8 + 2] = vaA + 4 * (q4[4] + g * 8 * q4[5] + 64 * mb); tb4[t * 8 + 3] = ntl; tb4[t * 8 + 4] = v;
+                    tb4[t * 8 + 5] = tb4[t * 8 + 6] = tb4[t * 8 + 7] = 0;
+                }
+                int img4 = !strcmp(ops[i].name, "qpu4_mmrelu") ? 1 : !strcmp(ops[i].name, "qpu4_mmrs") ? 2 : 0;
+                uint32_t h_out4 = syncobj_new();
+                csd_submit(vaC + 196608 + img4 * 8192, vaC + 262144 + nasm * 512, h_in, h_out4);
+                if (made_in) syncobj_free(h_in);
+                h_prev = h_out4; nasm++; i0 = i + 1;
+                continue;
+            }
             uint32_t *pu = &ubo[nasm * 128]; uint32_t *q = ops[i].push;      /* 512-byte block: 16 parameter words, then the 8-thread work table at +64 B */
             uint32_t PI = q[3] * 4, OP = q[5] * 4;
             pu[0] = vaA + q[2] * 4; pu[1] = PI; pu[2] = PI + 64; pu[3] = 2 * PI; pu[4] = 64; pu[5] = vaA + q[4] * 4; pu[6] = OP; pu[7] = OP - 64; pu[8] = 16 * OP;
@@ -226,28 +248,68 @@ int main(int argc, char **argv) {
             {   /* per-thread table: [m block base, first tile group, tile groups, tiles, valid m, passes, 0, 0]; blocks of 32 rows.
                    nblk <= 8: 8 // nblk tile groups share the n tiles; nblk > 8: every thread owns block t and repeats for passes of 256 rows */
                 uint32_t M = q[8], NTl = q[1], nblk = (M + 31) / 32; if (nblk < 1) nblk = 1; uint32_t *tb = pu + 16;
-                if (nblk > 8) {
-                    uint32_t P = (nblk + 7) / 8; if (P > 4) { fprintf(stderr, "M too large\n"); exit(1); }
-                    for (uint32_t t = 0; t < 8; t++) { uint32_t row[8] = { t * 32, 0, 1, NTl, M, P, 0, 0 }; memcpy(tb + t * 8, row, 32); }
-                } else {
-                    uint32_t G = 8 / nblk;
+                /* 2026-11-13 block passes: the kernel's pass loop now steps 32 rows, so a thread can sweep p consecutive row blocks.
+                   ng = ceil(nblk / p) block groups, G = 8 / ng tile groups per block group; per-thread work = p * ceil(NTl / G) tile passes.
+                   Pick the p with the least work (p = 1 is the old layout; ties keep the smaller p). Heads jobs use the pass loop for heads: p = 1.
+                   GPUPORT_BLOCKPASS=0: smallest feasible p only. */
+                int headsjob = !strcmp(ops[i].name, "qpu_mmh") || !strcmp(ops[i].name, "qpu_mmskh");
+                uint32_t bestp = 0, bestc = 0xffffffffu, pmin = (nblk + 7) / 8;
+                for (uint32_t pp = pmin; pp <= nblk; pp++) {
+                    uint32_t ng = (nblk + pp - 1) / pp, G = 8 / ng, c = pp * ((NTl + G - 1) / G);
+                    if (c < bestc) { bestc = c; bestp = pp; }
+                    if (headsjob || getenv("GPUPORT_BLOCKPASS_OFF")) break;
+                }
+                if (nblk > 256 / 32 * 4) { fprintf(stderr, "M too large\n"); exit(1); }
+                {
+                    uint32_t ng = (nblk + bestp - 1) / bestp, G = 8 / ng;
+                    /* heads job writing whole tiles (push 17 = 1): the last tile of head h spills into tile 0 of head h + 1, so the same thread must
+                       own both (it then writes them in order): tile groups G must divide NTl - 1 */
+                    if (headsjob && q[17]) while (G > 1 && (NTl - 1) % G) G--;
                     for (uint32_t t = 0; t < 8; t++) {
-                        int ntl = (t < G * nblk) ? (int)((NTl - t / nblk + G - 1) / G) : 0; if (t / nblk >= NTl) ntl = 0;
+                        uint32_t bgrp = t % ng, g = t / ng;
+                        int ntl = (t < G * ng && g < NTl) ? (int)((NTl - g + G - 1) / G) : 0;
+                        uint32_t pss = nblk - bgrp * bestp; if (pss > bestp) pss = bestp;
                         if (ntl <= 0) { uint32_t idle[8] = {0, 0, 1, 1, 0, 1, 0, 0}; memcpy(tb + t * 8, idle, 32); }
-                        else { uint32_t row[8] = { (t % nblk) * 32, t / nblk, G, (uint32_t)ntl, M, 1, 0, 0 }; memcpy(tb + t * 8, row, 32); }
+                        else { uint32_t row[8] = { bgrp * bestp * 32, g, G, (uint32_t)ntl, M, pss, 0, 0 }; memcpy(tb + t * 8, row, 32); }
                     }
                 }
                 pu[12] = vaC + 262144 + nasm * 512 + 64;
             }
-            int img = !strcmp(ops[i].name, "qpu_mmrs") ? 1 : !strcmp(ops[i].name, "qpu_mmrelu") ? 2 : !strcmp(ops[i].name, "qpu_mmrm") ? 3 : !strcmp(ops[i].name, "qpu_mmsk") ? 4 : 0;
+            int img = !strcmp(ops[i].name, "qpu_mmrs") ? 1 : !strcmp(ops[i].name, "qpu_mmrelu") ? 2 : !strcmp(ops[i].name, "qpu_mmrm") ? 3 : !strcmp(ops[i].name, "qpu_mmsk") ? 4 : !strcmp(ops[i].name, "qpu_mmsilu") ? 5 : 0;
+            /* heads variants (2026-11-13): one job runs all attention heads (pass loop over heads); push 13 = heads, 14 / 15 / 16 = A, weight stream, out strides (floats) */
+            int hd = !strcmp(ops[i].name, "qpu_mmh") ? 1 : !strcmp(ops[i].name, "qpu_mmskh") ? 2 : 0;
+            if (hd == 2) img = 4;
+            if (hd && q[8] > 256) { fprintf(stderr, "heads job: M %u > 256\n", q[8]); exit(1); }
             if (img == 4) {   /* skewed position term: lane stride (TP+1) floats, key row stride TP floats, base moved back by R0 rows; table words 6, 7 = T, R0 */
                 uint32_t TPf = q[5], LS = (TPf + 1) * 4, NS = TPf * 4, R0 = q[12];
                 pu[5] = vaA + (uint32_t)((int32_t)q[4] - (int32_t)(R0 * TPf)) * 4; pu[6] = LS; pu[7] = NS - 16 * LS; pu[8] = 16 * NS; pu[14] = 16 * LS;
                 for (uint32_t t = 0; t < 8; t++) { pu[16 + t * 8 + 6] = q[11]; pu[16 + t * 8 + 7] = R0; }
+                /* 2026-11-13: a block of 32 queries only needs the position columns r with 0 <= r - R0 + m < T, about T + 31 of the 2T - 1:
+                   give every thread just the tiles covering that range (first tile, stride G, count) instead of all tiles. GPUPORT_SK_FULL=1 = all tiles */
+                uint32_t Ms = q[8], NTs = q[1], nbs = (Ms + 31) / 32; if (nbs < 1) nbs = 1;
+                if (nbs <= 8 && !getenv("GPUPORT_SK_FULL")) {
+                    uint32_t Gs = 8 / nbs; int Tk = (int)q[11], R0i = (int)R0;
+                    for (uint32_t t = 0; t < 8; t++) {
+                        uint32_t b = t % nbs, g = t / nbs; uint32_t *row = pu + 16 + t * 8;
+                        int mlo = (int)b * 32, mhi = mlo + 31; if (mhi > (int)Ms - 1) mhi = (int)Ms - 1;
+                        int rlo = R0i - mhi, rhi = R0i + Tk - 1 - mlo; if (rlo < 0) rlo = 0;
+                        int tlo = rlo / 16, thi = rhi / 16; if (thi > (int)NTs - 1) thi = (int)NTs - 1;
+                        int cnt = thi - tlo + 1, ntl = (t < Gs * nbs && cnt > (int)g) ? (cnt - (int)g + (int)Gs - 1) / (int)Gs : 0;
+                        if (ntl <= 0) { row[0] = 0; row[1] = 0; row[2] = 1; row[3] = 1; row[4] = 0; row[5] = 1; }
+                        else { row[0] = b * 32; row[1] = (uint32_t)tlo + g; row[2] = Gs; row[3] = (uint32_t)ntl; row[4] = Ms; row[5] = 1; }
+                    }
+                }
             }
             if (img == 3) { pu[6] = OP; pu[7] = 4 - 16 * OP; pu[8] = 64; pu[14] = 16 * OP; }   /* row-major output: row bytes, step after odd acc, tile step, 16 rows */
+            if (hd) {   /* uniform layout of the heads kernels: word 4 = A stride, no M word; plain: 13 = W stride, 14 = out stride; skew: 13 = 16 * lane stride, 14, 15 = strides */
+                uint32_t se = pu[14];
+                pu[4] = q[14] * 4;
+                if (hd == 1) { pu[13] = q[15] * 4; pu[14] = q[16] * 4; }
+                else { pu[13] = se; pu[14] = q[15] * 4; pu[15] = q[16] * 4; }
+                for (uint32_t t = 0; t < 8; t++) if (pu[16 + t * 8 + 4]) pu[16 + t * 8 + 5] = q[13];   /* active threads: passes = heads */
+            }
             uint32_t h_out = syncobj_new();
-            csd_submit(vaC + img * 32768, vaC + 262144 + nasm * 512, h_in, h_out);
+            csd_submit(hd ? vaC + 196608 + (2 + hd) * 8192 : vaC + img * 32768, vaC + 262144 + nasm * 512, h_in, h_out);
             if (made_in) syncobj_free(h_in);
             h_prev = h_out; nasm++; i0 = i + 1;
         }

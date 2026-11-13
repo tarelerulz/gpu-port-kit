@@ -16,3 +16,7 @@ fe_phase.spv, fe_c0fix.spv: no flags (front-end convs as matmuls, 2026-11-12).
 2026-11-12 (two-stage DFT, fe3): fe_frame_k.spv, fe_tw.spv, fe_pw2.spv: no flags, local 256 (glslc --target-env=vulkan1.1 -O -I shaders X.comp -o X.spv).
 2026-11-12 (batch, -DBATCH=1 -DUA=1): gemm12av4o1b (AV4 OV4=1), gemm12wa1b (+WA), gemm12wp1b (+WP), gemm12wa2b (OV4=2 +WA). Workgroup y = batch;
   push u[22] A stride, u[23] out stride, u[24] W stride (WA/WP), floats per batch. Copies of gemm12.comp as gemm12*b.comp.
+repack_rows.spv: no flags (2026-11-13: head logits pitch 1040 -> contiguous)
+att_softmax_so.spv: no flags (2026-11-13: online softmax, skew layout)
+2026-11-13: ln_km4, dw_km4, glu_kmh, att_softmax_sk/so/t4 rebuilt with -DLS=16 (local_size_x 16: spreads the few threads over all QPUs); originals in shaders/bak-2026-11-13-ls/
+ln_st.spv, ln_nm.spv: no flags (2026-11-13: layer norm split into stats + normalize dispatches)

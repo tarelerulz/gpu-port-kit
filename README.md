@@ -26,6 +26,8 @@ The resident server source is in `runner/exec_server2.c`; build it with `sh tool
 Tested: `GpuEncoder2` gives the same logits as the original oido copy on the same 5-second clip (max difference 0).
 
 ## Map of the GPU
+- `OIDO_GPU_STORY.md`: the whole history of the Oido port in plain words (3.3 s -> 0.54 s for 10 s of speech), what worked and what did not.
+- `V3D_FINDINGS.md`: the short technical write-up of the V3D findings.
 - `GPU_MAP.md`: how the device, plans, memory and layouts work, with measured speed and known gaps. Read this first.
 - `GPU_SHADERS.md`: generated catalog of every shader (local size, bindings, push words). Regenerate: `python3 tools/catalog_shaders.py`.
 - `GPU_TIMINGS_T251.md`: per-op timings at nemo8 shapes. Regenerate: `python3 tools/bench_ops.py 251`.

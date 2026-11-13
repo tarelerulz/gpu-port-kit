@@ -2,7 +2,10 @@
 // LayerNorm on k-major data, 4 frames per invocation (2026-11-12): x[c][t], rows of pitch TP, vec4 = 4 frames.
 // Same formula as ln_km (two passes for mean and variance). Padding frames (t >= T) get whatever their input gives.
 // u: 0 T, 1 d, 2 TP, 3 in, 4 out, 5 gamma (weights), 6 beta (weights)
-layout(local_size_x = 256) in;
+#ifndef LS
+#define LS 256
+#endif
+layout(local_size_x = LS) in;
 layout(std430, binding = 0) buffer A4 { vec4 a4[]; };
 layout(std430, binding = 1) readonly buffer W { float w[]; };
 layout(push_constant) uniform P { uint u[32]; } p;

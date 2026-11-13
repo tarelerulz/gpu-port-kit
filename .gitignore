@@ -9,3 +9,9 @@ work/
 shaders/gemm_t_f16.spv
 shaders/gemm_t_f32.spv
 tools/exec_hybrid
+
+# backups and experiment leftovers
+*.bak-*
+bak-*/
+*.pd-experiment
+tools/exec_hybrid_prof

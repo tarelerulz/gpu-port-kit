@@ -4,7 +4,10 @@
 // out[c][t], rows of pitch TP. out = act(b[c] + sum_j w[j][c] * in[c][t + j - k/2]); weights [k][d] as for dw4.
 // Each step loads one aligned vec4 and serves 4 taps through fixed swizzles of two neighbouring vec4. k <= 33.
 // u: 0 T, 1 d, 2 k, 3 TP, 4 TPH, 5 in, 6 out, 7 w, 8 bias, 9 act (0 none, 1 silu)
-layout(local_size_x = 256) in;
+#ifndef LS
+#define LS 256
+#endif
+layout(local_size_x = LS) in;
 layout(std430, binding = 0) buffer A4 { vec4 a4[]; };
 layout(std430, binding = 1) readonly buffer W { float w[]; };
 layout(push_constant) uniform P { uint u[32]; } p;

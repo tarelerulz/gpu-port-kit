@@ -1,0 +1,27 @@
+#version 450
+// LayerNorm statistics, split over channel chunks (2026-11-13): 4 threads per frame quad, each sums d/4 channels.
+// x[c][t] k-major (rows of pitch TP, vec4 = 4 frames). Sums are of (x - c0), c0 = channel 0 of the frame (same formula as ln_km4).
+// Scratch per quad (9 vec4): chunk c4 -> [2 c4] = sum, [2 c4 + 1] = sum of squares; [8] = c0 (so an in-place normalize can still read it).
+// u: 0 T, 1 d, 2 TP, 3 in, 4 scratch
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer A4 { vec4 a4[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    uint T = p.u[0], d = p.u[1], ts = p.u[2] / 4u, q = id / 4u, c4 = id % 4u;
+    if (q * 4u >= T) return;
+    uint i4 = p.u[3] / 4u + q, S = p.u[4] / 4u + q * 9u, C = d / 4u;
+    vec4 c0 = a4[i4];
+    vec4 s0 = vec4(0.0), s1 = vec4(0.0), q0 = vec4(0.0), q1 = vec4(0.0);
+    uint c = c4 * C, e = c + C, e8 = c + (C & ~7u);
+    for (; c < e8; c += 8u) {
+        vec4 x0 = a4[i4 + c * ts] - c0, x1 = a4[i4 + (c + 1u) * ts] - c0, x2 = a4[i4 + (c + 2u) * ts] - c0, x3 = a4[i4 + (c + 3u) * ts] - c0;
+        vec4 x4 = a4[i4 + (c + 4u) * ts] - c0, x5 = a4[i4 + (c + 5u) * ts] - c0, x6 = a4[i4 + (c + 6u) * ts] - c0, x7 = a4[i4 + (c + 7u) * ts] - c0;
+        s0 += (x0 + x1) + (x2 + x3); s1 += (x4 + x5) + (x6 + x7);
+        q0 += (x0 * x0 + x1 * x1) + (x2 * x2 + x3 * x3); q1 += (x4 * x4 + x5 * x5) + (x6 * x6 + x7 * x7);
+    }
+    vec4 sm = s0 + s1, sq = q0 + q1;
+    for (; c < e; c++) { vec4 x = a4[i4 + c * ts] - c0; sm += x; sq += x * x; }
+    a4[S + 2u * c4] = sm; a4[S + 2u * c4 + 1u] = sq;
+    if (c4 == 0u) a4[S + 8u] = c0;
+}

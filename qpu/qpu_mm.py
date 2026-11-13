@@ -56,10 +56,19 @@ def emit_block(s, odd, lk=None):
             sub(KCNT, KCNT, 1, cond='pushz')
 
 
-def make_kernel(rs, relu=False, rm=False, skew=False):
+def make_kernel(rs, relu=False, rm=False, skew=False, silu=False, heads=False):
+    # heads (2026-11-13): the pass loop runs over attention heads instead of 256-row blocks: per pass A += SA, weight stream += SW, out += SO
+    # (bytes). Uniform word 4 = SA (64 is built here), no MV word; after the list: SW, SO (read late into NT / LANE, free after the prologue).
+    assert not (heads and (rs or silu))
     @qpu
     def kernel(asm):
-        for reg in [ABASE, PI, PI64, PI2, C64, OB, OP, OS2, OTILE, WADDR, WT, KP, NT, MV] + ([RSC] if rs else []) + ([SE] if rm else []):
+        if heads:
+            for reg in [ABASE, PI, PI64, PI2, RSC, OB, OP, OS2, OTILE, WADDR, WT, KP, NT] + ([SE] if rm else []):
+                nop(sig=ldunifrf(reg))
+            mov(C64, 1)
+            shl(C64, C64, 6)
+        else:
+          for reg in [ABASE, PI, PI64, PI2, C64, OB, OP, OS2, OTILE, WADDR, WT, KP, NT, MV] + ([RSC] if (rs or silu) else []) + ([SE] if rm else []):
             nop(sig=ldunifrf(reg))
         # per-thread table (8 words per thread at address NT = param 12): m block base, first tile group g, tile groups G, tiles, valid m
         tidx(r0)
@@ -111,6 +120,9 @@ def make_kernel(rs, relu=False, rm=False, skew=False):
             sub(null, r0, MV, cond='pushn')
             mov(TTV1, r2)
             mov(TTV1, NT, cond='ifa')
+        if heads:
+            nop(sig=ldunifrf(NT))                         # SW: weight stream bytes per head
+            nop(sig=ldunifrf(LANE))                       # SO: output bytes per head
         nop(sig=thrsw)
         nop()
         nop()
@@ -186,7 +198,18 @@ def make_kernel(rs, relu=False, rm=False, skew=False):
                         tmuwt()
                 else:
                     for j in range(NA):
-                        if relu:
+                        if silu:
+                            # silu(x) = x * recip(1 + 2^(-x log2 e)) with the SFU; RSC holds -log2(e) (push word 9)
+                            fmul(r0, ACC[j], RSC)
+                            mov(exp, r0)
+                            nop()
+                            nop()
+                            fadd(r0, r4, 1.0)
+                            mov(recip, r0)
+                            nop()
+                            nop()
+                            fmul(tmud, ACC[j], r4)
+                        elif relu:
                             fmax(tmud, ACC[j], 0.0)
                         else:
                             mov(tmud, ACC[j])
@@ -201,16 +224,22 @@ def make_kernel(rs, relu=False, rm=False, skew=False):
                 nop()
             # next pass: 256 rows further
             sub(PASS, PASS, 1, cond='pushz')
+            if heads:
+                add(WSAVE, WSAVE, NT)
             mov(WADDR, WSAVE)
             mov(TCNT, TCNT0)
-            shl(r0, C64, 4)                                   # 1024 bytes = 256 floats
-            shl(r1, C64, 2)                                   # 256 rows
-            add(ABASE, ABASE, r0)
-            add(LM, LM, r1)
-            if rm:
+            shl(r0, C64, 1)                                   # 128 bytes = 32 floats: the next block of 32 rows (2026-11-13; was 256 rows per pass)
+            shr(r1, C64, 1)                                   # 32 rows
+            if heads:
+                add(ABASE, ABASE, RSC)
+                add(OBS, OBS, LANE)
+            else:
+              add(ABASE, ABASE, r0)
+              add(LM, LM, r1)
+              if rm:
                 umul24(r2, r1, OP)
                 add(OBS, OBS, r2)
-            else:
+              else:
                 add(OBS, OBS, r0)
             mov(OB, OBS)
             lp.b(cond='anyna')
@@ -239,6 +268,9 @@ kernel_rs = make_kernel(True)
 kernel_relu = make_kernel(False, True)
 kernel_rm = make_kernel(False, False, True)
 kernel_skew = make_kernel(False, False, True, skew=True)
+kernel_h = make_kernel(False, heads=True)
+kernel_skew_h = make_kernel(False, False, True, skew=True, heads=True)
+kernel_silu = make_kernel(False, silu=True)
 
 
 def use_render_node():
@@ -285,7 +317,7 @@ def pack_weights(W, bias):
 
 
 def build(path):
-    for k_, p_ in ((kernel, path), (kernel_rs, path.replace('.qpu', 'rs.qpu')), (kernel_relu, path.replace('.qpu', 'relu.qpu')), (kernel_rm, path.replace('.qpu', 'rm.qpu')), (kernel_skew, path.replace('.qpu', 'sk.qpu'))):
+    for k_, p_ in ((kernel, path), (kernel_rs, path.replace('.qpu', 'rs.qpu')), (kernel_relu, path.replace('.qpu', 'relu.qpu')), (kernel_rm, path.replace('.qpu', 'rm.qpu')), (kernel_skew, path.replace('.qpu', 'sk.qpu')), (kernel_silu, path.replace('.qpu', 'silu.qpu'))):
         code = np.array(assemble(k_), dtype=np.uint64)
         code.tofile(p_)
         print(f'{len(code)} instructions -> {p_}')
@@ -371,6 +403,9 @@ if __name__ == '__main__':
     here = os.path.dirname(os.path.abspath(__file__))
     if mode == 'testrs':
         test_rs()
+    elif mode == 'buildh':                                # only the two heads variants, into the given directory
+        for k_, n_ in ((kernel_h, 'mm16h.qpu'), (kernel_skew_h, 'mm16skh.qpu')):
+            code = np.array(assemble(k_), dtype=np.uint64); code.tofile(os.path.join(sys.argv[2], n_)); print(len(code), 'instructions ->', n_)
     elif mode == 'build':
         build(os.path.join(here, 'mm16.qpu'))
     else:

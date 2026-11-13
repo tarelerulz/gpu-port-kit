@@ -17,6 +17,10 @@ MM16RS = MM16.replace('mm16.qpu', 'mm16rs.qpu')
 MM16RELU = MM16.replace('mm16.qpu', 'mm16relu.qpu')
 MM16RM = MM16.replace('mm16.qpu', 'mm16rm.qpu')
 MM16SK = MM16.replace('mm16.qpu', 'mm16sk.qpu')
+MM16SILU = MM16.replace('mm16.qpu', 'mm16silu.qpu')
+MM4 = MM16.replace('mm16.qpu', 'mm4.qpu')               # 4 vectors x 8 columns kernels (qpu/qpu_mm4.py): plain, relu, rs
+MM4RELU = MM16.replace('mm16.qpu', 'mm4relu.qpu')
+MM4RS = MM16.replace('mm16.qpu', 'mm4rs.qpu')
 
 
 class ExecServer:
@@ -33,7 +37,7 @@ class ExecServer:
         env = dict(os.environ, **VK_ENV)
         cmd = [self.binary, self.weights]
         if os.environ.get('GPUPORT_ASM') == '1':          # hand-written QPU matmul jobs interleaved with the Vulkan plan
-            cmd = [EXEC_HYBRID, self.weights, MM16, MM16RS, MM16RELU, MM16RM, MM16SK]
+            cmd = [EXEC_HYBRID, self.weights, MM16, MM16RS, MM16RELU, MM16RM, MM16SK, MM16SILU, MM4, MM4RELU, MM4RS, MM16.replace('mm16.qpu', 'mm16h.qpu'), MM16.replace('mm16.qpu', 'mm16skh.qpu')]   # last two: heads variants (2026-11-13)
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE, text=True, env=env, cwd=self.shader_dir)
         line = self.proc.stderr.readline()          # 'ready' once pipelines and buffers exist
@@ -42,6 +46,22 @@ class ExecServer:
         if 'ready' not in line:
             raise RuntimeError('exec_server2 did not start: ' + line.strip())
         return self
+
+    def io_dir(self):
+        """Request files (plan, input, output) go to RAM when /dev/shm exists (2026-11-13: the work dir is on the SD card root fs)."""
+        d = getattr(self, '_io', None)
+        if d is None:
+            d = self.work
+            try:
+                c = '/dev/shm/gpuport-%d-%d' % (os.getuid(), os.getpid())
+                if os.environ.get('GPUPORT_IO_SHM', '1') != '0' and os.path.isdir('/dev/shm'):
+                    os.makedirs(c, mode=0o700, exist_ok=True); d = c
+                    import atexit, shutil
+                    atexit.register(shutil.rmtree, c, True)          # a few MB of RAM per process: always removed at exit
+            except OSError:
+                pass
+            self._io = d
+        return d
 
     def run(self, plan, arena_init, out_off, out_n):
         """Returns (out float32[out_n], server_ms). Same contract as gpuport.run.run()."""
@@ -53,7 +73,7 @@ class ExecServer:
         with self.lock:
             self.start()
             self.seq += 1
-            base = os.path.join(self.work, f'srv_{self.seq % 4}')
+            base = os.path.join(self.io_dir(), f'srv_{self.seq % 4}')
             plan.write(base + '.plan')
             arena_init.astype('<f4').tofile(base + '.arena')
             marker = last_reset_marker()

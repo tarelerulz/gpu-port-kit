@@ -125,7 +125,7 @@ def gemm12v(plan, a_off, M, mm, out_off, K=None, N=None, sAm=None, epi=0):
 #   gemm12wa2       per head: ATT[i][h*dh..] = sum_j ST[j][i] * V[j]
 # Threads per workgroup, tuned per shader by measurement (tools: sweep in GPU_MAP section 22). Must match the .comp.
 BATCH = os.environ.get('GPUPORT_BATCH', '1') != '0'      # heads / column positions as workgroup-y batches (2026-11-12)
-LOCAL = {'ln_km4': 256, 'dw_km4': 256, 'att_softmax_t4': 128, 'tr_km': 256, 'att_prep': 256, 'att_comb': 256, 'glu_kmh': 256}
+LOCAL = {'ln_km4': 256, 'dw_km4': 256, 'att_softmax_t4': 256, 'tr_km': 256, 'att_prep': 256, 'att_comb': 256, 'glu_kmh': 256}
 
 
 def att_km_regions(T, d, H, pos=True, qpu=False):
@@ -154,7 +154,7 @@ def pos_table_km(Wpos, bpos, Tmax):
     return out, pitch
 
 
-def attention_km(plan, T, d, H, qkv, pe, mm_pos, pbu, pbv, att, R, pos=True, pos_tab=None, att_pitch=None, fused=True, qpu=False, pos_asm=None):
+def attention_km(plan, T, d, H, qkv, pe, mm_pos, pbu, pbv, att, R, pos=True, pos_tab=None, att_pitch=None, fused=True, qpu=False, pos_asm=None, noprep=False, pos_bias=False):
     """qkv: rows [q | k | v] (stride 3d). pe: positional table [2T-1][d]. mm_pos: put_mm of the pos projection.
     pbu, pbv: weight offsets. att: output [T][d]. R: region offsets with the att_km_regions names and 'TK'.
     Needs d % 4 == 0 and (d / H) % 4 == 0."""
@@ -175,24 +175,41 @@ def attention_km(plan, T, d, H, qkv, pe, mm_pos, pbu, pbv, att, R, pos=True, pos
             plan.add('tr_km', LOCAL['tr_km'], _g(Mp * d, LOCAL['tr_km']), 1, [mb, d, Mp, pe + r0 * d, d, TK])
             plan.add('gemm12av4o1', 256, _g((mm_pos['np'] // 12) * (Mp // 4)), 1,
                      [mb, d, d, mm_pos['np'], TK, 1, Mp, mm_pos['wo'], mm_pos['bo'], PT + r0, 1, PTP, 0])
-    plan.add('att_prep', LOCAL['att_prep'], _g(d * TP, LOCAL['att_prep']), 1, [T, d, dh, TP, qkv, QU, QV, KT, pbu, pbv])
+    if noprep:       # QU and KT already written by the caller's matmul; pos_bias: the position streams carry (v - u) . p, so they read QU
+        assert qpu and pos_asm is not None and pos_tab is not None and pos_bias
+    else:
+        plan.add('att_prep', LOCAL['att_prep'], _g(d * TP, LOCAL['att_prep']), 1, [T, d, dh, TP, qkv, QU, QV, KT, pbu, pbv])
+    QP = QU if pos_bias else QV          # A of the position-term jobs that use the pos_asm streams
     q4 = (T + 3) // 4
     NPg = (GR + 11) // 12 * 12
     name, wbase, wpitch = bd or ('gemm12wa1', PT, PTP)
-    skew = bool(qpu and pos_asm is not None and pos_tab is not None and T <= 256 and os.environ.get('GPUPORT_ASM_SKEW', '1') == '1')
+    skew = bool(qpu and pos_asm is not None and pos_tab is not None and (T <= 256 or len(_row_split(T)) == 2) and os.environ.get('GPUPORT_ASM_SKEW', '1') == '1')
     if qpu:        # scores on the QPU kernel: K^T packed to f16 tiles in the arena, one job per head (qpu_pack + qpu_mm, push 10 = 1)
         PK = R['PK']; nts = (T + 15) // 16; tws = 16 + 8 * dh
         plan.add('qpu_pack', 256, (nts * tws + 255) // 256, H, [dh, T, KT, TP, PK, nts, tws, dh * TP, nts * tws])
-        for h in range(H):
-            plan.add('qpu_mm', 256, 1, 1, [dh, nts, QU + h * dh * TP, TP, ST + h * T * TP, TP, PK + h * nts * tws, tws, T, 0, 1])
+        hj = os.environ.get('GPUPORT_ASM_HEADS', '1') != '0' and H > 1      # all heads in one job (2026-11-13): saves ~0.09 ms launch per job
+        # scores / A x V write whole 16-column tiles: the last tile of head h spills into the first rows of head h + 1, which head h + 1 must
+        # overwrite LATER. In one job that order only holds when each thread owns every tile of its row block (8 blocks, rm_ > 224).
+        for r0, rm_ in _row_split(T):       # queries [r0, r0 + rm_): balanced blocks above 256 / 128 frames
+            if hj and rm_ <= 256 and ((rm_ + 31) // 32 == 8 or os.environ.get('GPUPORT_ASM_HEADS_ALL', '1') != '0'):     # push 17 = 1: runner keeps first + last tile on one thread
+                plan.add('qpu_mmh', 256, 1, 1, [dh, nts, QU + r0, TP, ST + r0, TP, PK, tws, rm_, 0, 1, 0, 0, H, dh * TP, nts * tws, T * TP, 1])
+                continue
+            for h in range(H):
+                plan.add('qpu_mm', 256, 1, 1, [dh, nts, QU + h * dh * TP + r0, TP, ST + h * T * TP + r0, TP, PK + h * nts * tws, tws, rm_, 0, 1])
         if pos_asm is not None and pos_tab is not None:       # position term from the static f16 tables (phase = window start mod 16)
             phi, u0, ntp, twp = s4 % 16, s4 // 16, (GR + 15) // 16, 16 + 8 * dh
             if skew:     # written already shifted (key j, query i) = row T-1+e + j - i: contiguous for the softmax, no gather
-                for h in range(H):
-                    plan.add('qpu_mmsk', 256, 1, 1, [dh, ntp, QV + h * dh * TP, TP, GT + h * T * TP, TP, pos_asm[phi // 4][h] + u0 * twp, twp, T, 0, 0, T, T - 1 + e])
+                pa_ = pos_asm[phi // 4]; sw_ = pa_[1] - pa_[0] if H > 1 else 0
+                hs = hj and all(pa_[h + 1] - pa_[h] == sw_ for h in range(H - 1)) and sw_ > 0      # heads job needs a constant weight-stream stride
+                for h in range(1 if hs else H):
+                    for r0, rm_ in _row_split(T):     # lane m = r0 + m': key row j = r - (R0 - r0) + m', column r0 + m'
+                        if hs:
+                            plan.add('qpu_mmskh', 256, 1, 1, [dh, ntp, QP + r0, TP, GT + r0, TP, pa_[0] + u0 * twp, twp, rm_, 0, 0, T, T - 1 + e - r0, H, dh * TP, sw_, T * TP])
+                        else:
+                            plan.add('qpu_mmsk', 256, 1, 1, [dh, ntp, QP + h * dh * TP + r0, TP, GT + h * T * TP + r0, TP, pos_asm[phi // 4][h] + u0 * twp, twp, rm_, 0, 0, T, T - 1 + e - r0])
             else:
                 for h in range(H):
-                    plan.add('qpu_mm', 256, 1, 1, [dh, ntp, QV + h * dh * TP, TP, GT + h * GR * TP, TP, pos_asm[phi // 4][h] + u0 * twp, twp, T, 0, 0])
+                    plan.add('qpu_mm', 256, 1, 1, [dh, ntp, QP + h * dh * TP, TP, GT + h * GR * TP, TP, pos_asm[phi // 4][h] + u0 * twp, twp, T, 0, 0])
         else:
             plan.add(name + 'b', 256, _g((NPg // 12) * q4), H, [T, GR, dh, NPg, QV, 1, TP, wbase, none, GT, 1, TP, 0] + [0] * 8 + [wpitch, dh * TP, GR * TP, dh * wpitch])
     elif BATCH:      # heads in one dispatch (workgroup y); u[22] A stride, u[23] out stride, u[24] W stride (2026-11-12)
@@ -206,7 +223,7 @@ def attention_km(plan, T, d, H, qkv, pe, mm_pos, pbu, pbv, att, R, pos=True, pos
             push = [T, GR, dh, NPg, QV + hb, 1, TP, wbase + h * dh * wpitch, none, GT + h * GR * TP, 1, TP, 0] + [0] * 8 + [wpitch]
             plan.add(name, 256, _g((NPg // 12) * q4), 1, push)
     if skew:        # position term already shifted by the QPU kernel: add + softmax, no gather
-        plan.add('att_softmax_sk', LOCAL['att_softmax_t4'], _g(H * q4, LOCAL['att_softmax_t4']), 1, [T, H, TP, ST, GT, e, GR])
+        plan.add('att_softmax_sk' if os.environ.get('GPUPORT_SM_ONLINE', '1') == '0' else 'att_softmax_so', LOCAL['att_softmax_t4'], _g(H * q4, LOCAL['att_softmax_t4']), 1, [T, H, TP, ST, GT, e, GR])
     elif fused:       # shift + add + softmax in one pass, 4 queries per thread
         plan.add('att_softmax_t4', LOCAL['att_softmax_t4'], _g(H * q4, LOCAL['att_softmax_t4']), 1, [T, H, TP, ST, GT, e, GR])
     else:
@@ -216,8 +233,12 @@ def attention_km(plan, T, d, H, qkv, pe, mm_pos, pbu, pbv, att, R, pos=True, pos
     if qpu and att_pitch:       # attention x V on the QPU kernel: V packed per head, K = T rounded up to even (zero row), 3 tiles of 16 channels
         PK = R['PK']; Kv = T + (T & 1); twv = 16 + 8 * Kv
         plan.add('qpu_pack', 256, (3 * twv + 255) // 256, H, [T, dh, qkv + 2 * d, 3 * d, PK, 3, twv, dh, 3 * twv])
-        for h in range(H):
-            plan.add('qpu_mm', 256, 1, 1, [Kv, 3, ST + h * T * TP, TP, att + h * dh * att_pitch, att_pitch, PK + h * 3 * twv, twv, T, 0, 1])
+        for r0, rm_ in _row_split(T):
+            if os.environ.get('GPUPORT_ASM_HEADS', '1') != '0' and H > 1 and rm_ <= 256 and ((rm_ + 31) // 32 == 8 or os.environ.get('GPUPORT_ASM_HEADS_ALL', '1') != '0'):
+                plan.add('qpu_mmh', 256, 1, 1, [Kv, 3, ST + r0, TP, att + r0, att_pitch, PK, twv, rm_, 0, 1, 0, 0, H, T * TP, 3 * twv, dh * att_pitch, 1])
+                continue
+            for h in range(H):
+                plan.add('qpu_mm', 256, 1, 1, [Kv, 3, ST + h * T * TP + r0, TP, att + h * dh * att_pitch + r0, att_pitch, PK + h * 3 * twv, twv, rm_, 0, 1])
         return plan
     if BATCH and att_pitch:
         plan.add('gemm12wa1b', 256, _g((NPv // 12) * q4), H,
@@ -273,26 +294,84 @@ def gemm_km_batch(plan, src, M, pitch, mm, out, out_pitch, nb, src_stride, out_s
     return plan
 
 
+def _row_split(M):
+    """Balanced row blocks for the QPU matmul kernels (2026-11-13): M in 129..136 or 257..328 would leave a nearly empty second block / second pass
+    (5 of 8 threads busy, or a whole extra pass for a few rows). Run rows [0, r0) and [r0, M) as two jobs instead; the tail job spreads over all 8 threads.
+    GPUPORT_ASM_SPLIT=0 turns it off (the plan then falls back to the Mesa path for those lengths, see nemo8.use_asm)."""
+    import os
+    if os.environ.get('GPUPORT_ASM_SPLIT', '1') != '0':
+        for lo, hi in ((128, 192), (256, 512)):      # 5 or 6 blocks (3 blocks, 65-96 rows: split TESTED worse, 254 -> 269 ms)   # 3, 5 or 6 blocks of 32 rows leave QPUs idle (G = 8 // nblk); 2026-11-13: was (128, 136), (256, 512)
+            if lo < M <= hi:
+                return [(0, lo), (lo, M - lo)]
+    return [(0, M)]
+
+
 def asm_mm(plan, a_off, M, a_pitch, asm, out_off, out_pitch, relu=False):
     """Hand-written QPU matmul (exec_hybrid runner, work/asm/qpu_mm.py): out[n][m] = bias[n] + sum_k W[k][n] * A[k][m] for m < M <= 256,
     A / out k-major with the given row pitches (floats). asm = dict(wo, k, ntiles, tile_words) from nemo8.put_asm. Not a shader: the
     runner submits it as a raw CSD job. No activation (add a silu / relu op after it)."""
     assert M <= 1024
-    plan.add('qpu_mmrelu' if relu else 'qpu_mm', 256, 1, 1, [asm['k'], asm['ntiles'], a_off, a_pitch, out_off, out_pitch, asm['wo'], asm['tile_words'], M])
+    for r0, rm_ in _row_split(M):
+        plan.add('qpu_mmrelu' if relu else 'qpu_mm', 256, 1, 1, [asm['k'], asm['ntiles'], a_off + r0, a_pitch, out_off + r0, out_pitch, asm['wo'], asm['tile_words'], rm_])
     return plan
 
 
 def asm_mm_rs(plan, a_off, M, a_pitch, asm, out_off, out_pitch, scale):
     """Like asm_mm but out += scale * (acc + bias) (the residual add folded in, qpu_mm.kernel_rs)."""
     assert M <= 1024
-    plan.add('qpu_mmrs', 256, 1, 1, [asm['k'], asm['ntiles'], a_off, a_pitch, out_off, out_pitch, asm['wo'], asm['tile_words'], M, fbits(scale)])
+    for r0, rm_ in _row_split(M):
+        plan.add('qpu_mmrs', 256, 1, 1, [asm['k'], asm['ntiles'], a_off + r0, a_pitch, out_off + r0, out_pitch, asm['wo'], asm['tile_words'], rm_, fbits(scale)])
+    return plan
+
+
+def asm_mm_silu(plan, a_off, M, a_pitch, asm, out_off, out_pitch):
+    """Like asm_mm but silu(acc + bias) applied in the epilogue (SFU exp + recip, qpu_mm.kernel_silu); push word 9 = -log2(e)."""
+    assert M <= 1024
+    for r0, rm_ in _row_split(M):
+        plan.add('qpu_mmsilu', 256, 1, 1, [asm['k'], asm['ntiles'], a_off + r0, a_pitch, out_off + r0, out_pitch, asm['wo'], asm['tile_words'], rm_, fbits(-1.4426950408889634)])
+    return plan
+
+
+def _pieces4(M, old):
+    """Row pieces for the 4 x 8 kernel (64-row blocks): (r0, rows, use_old_kernel). 2026-11-13: a leftover of <= 32 rows after 1, 2 or 4 full
+    blocks costs a whole 64-row block there; the 2 x 16 kernel (32-row block, same weights in its own tile format: old) does it at half the cost.
+    GPUPORT_ASM_TAIL=0 = off."""
+    import os
+    if old is not None and os.environ.get('GPUPORT_ASM_TAIL', '1') != '0' and os.environ.get('GPUPORT_ASM_SPLIT', '1') != '0':
+        for lo in (64, 128, 256):
+            if lo < M <= lo + 32:
+                return [(0, lo, False), (lo, M - lo, True)]
+    return [(r0, rm_, False) for r0, rm_ in _row_split(M)]
+
+
+def asm4_mm(plan, a_off, M, a_pitch, asm, out_off, out_pitch, relu=False, old=None):
+    """4 vectors x 8 columns QPU kernel (qpu/qpu_mm4.py, weights from nemo8.put_asm4): out[n][m] = bias[n] + sum_k W[k][n] A[k][m], k-major, M <= 512.
+    old: the same matrix in the 2 x 16 kernel's format (nemo8.put_asm) for a short row tail (_pieces4)."""
+    assert M <= 512
+    for r0, rm_, o_ in _pieces4(M, old):
+        if o_:
+            plan.add('qpu_mmrelu' if relu else 'qpu_mm', 256, 1, 1, [old['k'], old['ntiles'], a_off + r0, a_pitch, out_off + r0, out_pitch, old['wo'], old['tile_words'], rm_])
+        else:
+            plan.add('qpu4_mmrelu' if relu else 'qpu4_mm', 256, 1, 1, [asm['k'], asm['ntiles'], a_off + r0, a_pitch, out_off + r0, out_pitch, asm['wo'], asm['tile_words'], rm_])
+    return plan
+
+
+def asm4_mm_rs(plan, a_off, M, a_pitch, asm, out_off, out_pitch, scale, old=None):
+    """asm4_mm with out += scale * (acc + bias) (residual folded in)."""
+    assert M <= 512
+    for r0, rm_, o_ in _pieces4(M, old):
+        if o_:
+            plan.add('qpu_mmrs', 256, 1, 1, [old['k'], old['ntiles'], a_off + r0, a_pitch, out_off + r0, out_pitch, old['wo'], old['tile_words'], rm_, fbits(scale)])
+        else:
+            plan.add('qpu4_mmrs', 256, 1, 1, [asm['k'], asm['ntiles'], a_off + r0, a_pitch, out_off + r0, out_pitch, asm['wo'], asm['tile_words'], rm_, fbits(scale)])
     return plan
 
 
 def asm_mm_rm(plan, a_off, M, a_pitch, asm, out_off, row_pitch):
     """Like asm_mm but the output is row-major [m][n] with row pitch row_pitch floats (qpu_mm.kernel_rm); for matmuls whose consumer reads rows."""
     assert M <= 1024
-    plan.add('qpu_mmrm', 256, 1, 1, [asm['k'], asm['ntiles'], a_off, a_pitch, out_off, row_pitch, asm['wo'], asm['tile_words'], M])
+    for r0, rm_ in _row_split(M):
+        plan.add('qpu_mmrm', 256, 1, 1, [asm['k'], asm['ntiles'], a_off + r0, a_pitch, out_off + r0 * row_pitch, row_pitch, asm['wo'], asm['tile_words'], rm_])
     return plan
 
 
@@ -310,6 +389,13 @@ def gemm_to_km(plan, a_off, M, mm, out, out_pitch, kscratch, sAm=None, epi=0):
 
 
 def ln_km(plan, T, d, TP, in_off, out_off, gamma_off, v4=True):
+    sc_ = getattr(plan, 'ln_scratch', None)
+    if v4 and sc_ is not None and d % 16 == 0 and os.environ.get('GPUPORT_LN_SPLIT', '0') == '1':      # TESTED slower (10 s: 554 -> 578 ms): off by default
+        # 2026-11-13: ln_km4 walks all d channels serially per thread (~0.2 ms whatever T). Split: statistics over 4 channel chunks,
+        # then normalize with one thread per 16 channels. plan.ln_scratch = 9 vec4 per frame quad.
+        Tq = (T + 3) // 4
+        plan.dispatch('ln_st', 256, Tq * 4, [T, d, TP, in_off, sc_])
+        return plan.dispatch('ln_nm', 256, Tq * (d // 16), [T, d, TP, in_off, out_off, gamma_off, gamma_off + d, sc_])
     if v4:          # 4 frames per thread: 0.93 -> see GPU_MAP section 21
         return plan.dispatch('ln_km4', LOCAL['ln_km4'], (T + 3) // 4, [T, d, TP, in_off, out_off, gamma_off, gamma_off + d])
     return plan.dispatch('ln_km', 64, T, [T, d, TP, in_off, out_off, gamma_off, gamma_off + d])

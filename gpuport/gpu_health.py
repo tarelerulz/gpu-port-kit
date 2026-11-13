@@ -34,6 +34,18 @@ def _kernel_log_text():
 
 def last_reset_marker():
     """The last reset line in the kernel log ('' if none, or None if the log cannot be read)."""
+    try:                                     # fast path (2026-11-13): search the raw klogctl bytes, no decode / splitlines (3.2 -> ~0.3 ms)
+        libc = ctypes.CDLL(None, use_errno=True)
+        n = libc.klogctl(3, _KLOG_BUF, len(_KLOG_BUF))
+        if n >= 0:
+            raw = ctypes.string_at(_KLOG_BUF, n)          # only the n bytes read (.raw copies the whole 4 MB buffer)
+            i = raw.rfind(RESET_TEXT.encode())
+            if i < 0:
+                return ''
+            a = raw.rfind(b'\n', 0, i) + 1; b = raw.find(b'\n', i)
+            return re.sub(r'^<\d+>', '', raw[a:b if b >= 0 else n].decode(errors='replace'))
+    except Exception:
+        pass
     try:
         out = _kernel_log_text()
     except Exception:

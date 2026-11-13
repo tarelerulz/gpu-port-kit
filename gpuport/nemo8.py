@@ -26,8 +26,8 @@ def load_nemo_ref():
     m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m); return m
 
 
-FE2_MIN_T = 48        # frames (1.9 s): from here the matmul front end is faster (measured 2026-11-12)
-POS_TMAX = 304        # frames covered by the cached position tables (12.1 s); longer clips compute them per run
+FE2_MIN_T = int(os.environ.get('GPUPORT_FE2_MIN_T', '48'))        # frames (1.9 s): from here the matmul front end is faster (measured 2026-11-12)
+POS_TMAX = 512        # frames covered by the cached position tables (20.5 s; was 304 = 12.1 s); longer clips compute them per run
 
 
 def prepare(nr, model=MODEL, int8=False, pos_cache=True):
@@ -114,11 +114,22 @@ def prepare(nr, model=MODEL, int8=False, pos_cache=True):
         tw = np.stack([np.cos(ph), -np.sin(ph)], -1).astype(np.float32).reshape(-1)
         fe3 = dict(w1=w.put_mm(W1, np.zeros(32)), w2=w.put_mm(W2d, np.zeros(34)), tw=w.put(tw))
         w.put(np.zeros(16, np.float32))
-    asm = None
+    asm = asm4 = head_asm = None
     if pos_cache and not int8 and os.environ.get('GPUPORT_ASM') == '1':     # QPU kernel weights (f16 pairs), appended
         asm = [{k_: put_asm(w, L_[k_]) for k_ in ASM_KEYS} for L_ in layers]
         if fe2:
             asm.append(dict(c2=put_asm(w, ('f32', W2, c2_b)), sub=put_asm(w, ('f32', sub_W * np.sqrt(d), sub_b * np.sqrt(d)))))   # last entry: conv2 (K = 9 sc, relu) and the subsampling matmul
+        for a_, L_ in zip(asm, layers):          # 2026-11-13 (no att_prep): [QU | KT] = [scale (Wq x + bq + pbu) | Wk x + bk] k-major; V on its own
+            Wq_, bq_ = np.asarray(L_['qkv'][1], np.float32), np.asarray(L_['qkv'][2], np.float32); sc_ = 1.0 / np.sqrt(np.float32(d // H))
+            a_['quk'] = put_asm(w, ('f32', np.concatenate([Wq_[:d] * sc_, Wq_[d:2 * d]]), np.concatenate([(bq_[:d] + np.asarray(L_['pbu'], np.float32)) * sc_, bq_[d:2 * d]])))
+            a_['vv'] = put_asm(w, ('f32', Wq_[2 * d:], bq_[2 * d:]))
+        asm4 = [{k_: put_asm4(w, L_[k_]) for k_ in ASM4_KEYS} for L_ in layers]                   # same matrices in 8-column tiles (4 x 8 kernel), M <= 512
+        if fe2:
+            asm4.append(dict(c2=put_asm4(w, ('f32', W2, c2_b)), sub=put_asm4(w, ('f32', sub_W * np.sqrt(d), sub_b * np.sqrt(d)))))
+        hW_, hb_ = np.asarray(head_l[1], np.float32), np.asarray(head_l[2], np.float32)       # head: N = V + 1 padded to a tile multiple (zeros) for the row-major QPU kernel
+        NH = (hW_.shape[0] + 15) // 16 * 16
+        head_asm = put_asm(w, ('f32', np.concatenate([hW_, np.zeros((NH - hW_.shape[0], hW_.shape[1]), np.float32)]), np.concatenate([hb_, np.zeros(NH - hb_.shape[0], np.float32)])))
+        head_asm['np_'] = NH
         w.put(np.zeros(16, np.float32))
     pos_asm = None
     if asm is not None and pos_tab is not None:     # static position tables as f16 tile streams, four column phases (window starts are multiples of 4)
@@ -132,13 +143,17 @@ def prepare(nr, model=MODEL, int8=False, pos_cache=True):
                     Wm = tab[h * dh_:(h + 1) * dh_, phi:].T
                     n16 = (Wm.shape[0] + 15) // 16 * 16
                     Wp = np.zeros((n16, dh_), np.float32); Wp[:Wm.shape[0]] = Wm
-                    row.append(w.put(asm_stream(Wp, np.zeros(n16, np.float32)).view(np.float32)))
+                    # 2026-11-13 (pos_bias): (q + v) . p = (q + u) . p + (v - u) . p; the last term does not depend on the query, so it is the
+                    # bias of position column r. The position job then reads QU and nothing needs QV.
+                    dvu = (np.asarray(L_['pbv'], np.float32) - np.asarray(L_['pbu'], np.float32))[h * dh_:(h + 1) * dh_] / np.sqrt(np.float32(dh_))
+                    row.append(w.put(asm_stream(Wp, (Wp @ dvu).astype(np.float32)).view(np.float32)))
                 per.append(row)
             pos_asm.append(per)
         w.put(np.zeros(16, np.float32))
-    return w, dict(d=d, H=H, ff=ff, k=k, nl=nl, sc=sc, V=V, f2=f2, fe=fe, layers=lay, head=head, tokens=toks, int8=int8, pos_tab=pos_tab, fe2=fe2, fe3=fe3, asm=asm, pos_asm=pos_asm)
+    return w, dict(d=d, H=H, ff=ff, k=k, nl=nl, sc=sc, V=V, f2=f2, fe=fe, layers=lay, head=head, tokens=toks, int8=int8, pos_tab=pos_tab, fe2=fe2, fe3=fe3, asm=asm, pos_asm=pos_asm, asm4=asm4, head_asm=head_asm, pos_bias=bool(pos_asm))
 
 
+ASM4_KEYS = ('ff1_2', 'ff2_2')      # K = 704 matmuls with the residual folded in: faster on the 4 x 8 tiling (GPUPORT_ASM4=0 = old kernel everywhere)
 ASM_KEYS = ('ff1_1', 'ff2_1', 'ff1_2', 'ff2_2', 'out', 'pw2', 'qkv', 'pw1')   # matmuls run by the hand-written QPU kernel (GPUPORT_ASM=1, exec_hybrid runner)
 
 
@@ -158,6 +173,16 @@ def put_asm(w, x):
     words = np.transpose(h[:, :, 0, :].astype(np.uint32) | (h[:, :, 1, :].astype(np.uint32) << 16), (0, 2, 1))
     st = np.concatenate([b_.reshape(N_ // 16, 16).view(np.uint32), words.reshape(N_ // 16, K_ * 8)], axis=1).reshape(-1).astype(np.uint32)
     return dict(wo=w.put(st.view(np.float32)), k=K_, ntiles=N_ // 16, tile_words=16 + 8 * K_)
+
+
+def put_asm4(w, x):
+    """Weights for the 4 vectors x 8 columns QPU kernel (qpu/qpu_mm4.py): tiles of 8 outputs, 8 bias words + K * 4 f16-pair words each."""
+    W_, b_ = np.asarray(x[1], np.float32), np.asarray(x[2], np.float32)
+    N_, K_ = W_.shape
+    h = W_.astype(np.float16).view(np.uint16).reshape(N_ // 8, 4, 2, K_)
+    words = np.transpose(h[:, :, 0, :].astype(np.uint32) | (h[:, :, 1, :].astype(np.uint32) << 16), (0, 2, 1))
+    st = np.concatenate([b_.reshape(N_ // 8, 8).view(np.uint32), words.reshape(N_ // 8, K_ * 4)], axis=1).reshape(-1).astype(np.uint32)
+    return dict(wo=w.put(st.view(np.float32)), k=K_, ntiles=N_ // 8, tile_words=8 + 4 * K_)
 
 
 def put_lin(w, x):
@@ -230,11 +255,13 @@ def _build(n, L, optimized=True, av4=None, att_km=None):
     # fe2 (2026-11-12): conv0 and conv2 as matmuls on regrouped data, no patches, output straight into the k-major
     # input of the subsampling matmul. GPUPORT_FE2=0 = conv0 shader + im2col.
     # Under about 1.8 s (48 frames) the 20 per-column conv2 matmuls cost more than they save, so short clips keep im2col.
-    fe2 = bool(km and L.get('fe2') and os.environ.get('GPUPORT_FE2', '1') != '0' and Tq >= FE2_MIN_T)
+    fe2 = bool(km and L.get('fe2') and os.environ.get('GPUPORT_FE2', '1') != '0' and Tq >= (min(FE2_MIN_T, 16) if os.environ.get('GPUPORT_ASM') == '1' else FE2_MIN_T))   # QPU kernels: matmul front end wins from ~0.6 s (2026-11-13: T=38 190 -> 155 ms, T=7 107 -> 121)
     # fe3 (2026-11-12): the DFT as two small matmuls (16 x 32) instead of two dense 512 x 257 ones; GPUPORT_FE3=0 = dense DFT
     fe3 = bool(fe2 and L.get('fe3') and os.environ.get('GPUPORT_FE3', '1') != '0')
-    use_asm = bool(L.get('asm')) and os.environ.get('GPUPORT_ASM') == '1' and 1 <= T <= 1024 and km and (os.environ.get('GPUPORT_ASM_GATE') == 'off' or not (129 <= T <= 136 or 257 <= T <= 328))
-    att_qpu = bool(use_asm and att_km and os.environ.get('GPUPORT_ASM_ATT', '1') == '1')       # attention scores and A x V on the QPU kernel (packed f16 K / V)
+    use_asm = bool(L.get('asm')) and os.environ.get('GPUPORT_ASM') == '1' and 1 <= T <= 1024 and km and (os.environ.get('GPUPORT_ASM_GATE') == 'off' or os.environ.get('GPUPORT_ASM_SPLIT', '1') != '0' or not (129 <= T <= 136 or 257 <= T <= 328))
+    use_asm4 = bool(use_asm and L.get('asm4') and T <= 512 and os.environ.get('GPUPORT_ASM4', '1') != '0')      # 4 x 8 kernel for K >= 704 matmuls
+    use_head_qpu = bool(use_asm and km and L.get('head_asm') and os.environ.get('GPUPORT_ASM_HEAD', '1') != '0')     # output head on the row-major QPU kernel (N padded to 1040) + repack to pitch V + 1
+    att_qpu = bool(use_asm and att_km and os.environ.get('GPUPORT_ASM_ATT', '1') == '1' and (os.environ.get('GPUPORT_ASM_GATE') == 'off' or (os.environ.get('GPUPORT_ASM_SPLIT', '1') != '0' and not 129 <= T <= 136) or not (129 <= T <= 136 or 257 <= T <= 328)))       # attention scores and A x V on the QPU kernel (packed f16 K / V)
     Tk = Tp if km else T                     # frames per row of the layer regions
     FRS = 516 if optimized else 512          # padded frame row stride (512 was 7x slower in the DFT matmul)
     ar = Arena(limit=ARENA_FLOATS)
@@ -244,7 +271,9 @@ def _build(n, L, optimized=True, av4=None, att_km=None):
                        ('FL', T3 * sc * 20), ('X', Tk * d), ('HB', Tk * d), ('H2', Tk * (max(ff, 2 * d) if km else ff)),
                        ('QKV', T * 3 * d), ('P', NP * d), ('PE', NP * d), ('ATT', Tk * d),
                        ('GL', (Tk + 32) * d if km else T * d), ('CV', Tk * d),
-                       ('SC', H * T * T), ('LOG', T * V1)]:
+                       ('SC', H * T * T), ('LOG', T * V1), ('LOGP', T * L['head_asm']['np_'] if use_head_qpu else 0)]:
+        if name == 'LOGP' and not use_head_qpu:
+            continue
         if att_km and name in ('P', 'SC') or pos_cache and name == 'PE':   # the matmul attention has its own regions
             continue
         if fe2 and name in ('C0', 'PAT', 'C2', 'FL'):
@@ -255,13 +284,17 @@ def _build(n, L, optimized=True, av4=None, att_km=None):
     if av4:
         # k-major scratch for the transposed matmul input: K <= max(d, ff, 9*sc, 20*sc), 252 rows per block
         R['TK'] = ar.alloc('TK', max(d, ff, 9 * sc, 20 * sc) * 252)
+        if os.environ.get('GPUPORT_LN_SPLIT', '0') == '1':
+            R['LNS'] = ar.alloc('LNS', 36 * ((T + 3) // 4) + 64)          # layer norm partial sums (ops.ln_km split, 2026-11-13; off by default)
+        if att_qpu and L.get('pos_bias') and os.environ.get('GPUPORT_ASM_NOPREP', '1') != '0':
+            R['QUK'] = ar.alloc('QUK', 2 * d * ((T + 11) // 12 * 12) + 64)   # [QU | KT] written by one matmul (no att_prep, 2026-11-13)
     if fe2:
         for name, size in [('Z', 82 * 8 * Tp), ('PL', 42 * 3 * sc * Tp), ('FLK', 20 * sc * Tp)]:
             R[name] = ar.alloc(name, size)
     if att_km:
         for name, size in ops.att_km_regions(T, d, H, pos=not pos_cache, qpu=att_qpu):
             R[name] = ar.alloc(name, size)
-    p = Plan()
+    p = Plan(); p.ln_scratch = R.get('LNS')
     XIN, FR, RE, IM, PW, MEL = (R.get(x) for x in ['XIN', 'FR', 'RE', 'IM', 'PW', 'MEL'])
     if fe3:
         # stage 1: M = Tm * 32 rows (t, n2), K = 13 (n1), N = 32 (re / im of k1); stage 2: M = Tm * 16 rows (t, k1), K = 64, N = 34
@@ -299,14 +332,20 @@ def _build(n, L, optimized=True, av4=None, att_km=None):
         p.dispatch('fe_c0fix', 64, 42 * 3 * sc, [T3, T2, sc, Tp, PL])
         if use_asm and os.environ.get('GPUPORT_ASM_CONV', '1') == '1':     # conv2: 20 QPU jobs (one per column position), relu epilogue
             for f in range(20):
-                ops.asm_mm(p, PL + 2 * f * 3 * sc * Tp, T3, Tp, L['asm'][-1]['c2'], FLK + f * Tp, 20 * Tp, relu=True)
+                if use_asm4:
+                    ops.asm4_mm(p, PL + 2 * f * 3 * sc * Tp, T3, Tp, L['asm4'][-1]['c2'], FLK + f * Tp, 20 * Tp, relu=True, old=L['asm'][-1]['c2'])
+                else:
+                    ops.asm_mm(p, PL + 2 * f * 3 * sc * Tp, T3, Tp, L['asm'][-1]['c2'], FLK + f * Tp, 20 * Tp, relu=True)
         elif os.environ.get('GPUPORT_BATCH', '1') != '0':
             ops.gemm_km_batch(p, PL, T3, Tp, L['fe2']['c2p'], FLK, 20 * Tp, 20, 6 * sc * Tp, Tp, epi=3)
         else:
           for f in range(20):
             ops.gemm_km(p, PL + 2 * f * 3 * sc * Tp, T3, Tp, L['fe2']['c2p'], FLK + f * Tp, 20 * Tp, epi=3)
         if use_asm and os.environ.get('GPUPORT_ASM_CONV', '1') == '1':
-            ops.asm_mm(p, FLK, T3, Tp, L['asm'][-1]['sub'], X, Tp)
+            if use_asm4:
+                ops.asm4_mm(p, FLK, T3, Tp, L['asm4'][-1]['sub'], X, Tp, old=L['asm'][-1]['sub'])
+            else:
+                ops.asm_mm(p, FLK, T3, Tp, L['asm'][-1]['sub'], X, Tp)
         else:
             ops.gemm_km(p, FLK, T3, Tp, fe['sub'], X, Tp)
     else:
@@ -335,6 +374,9 @@ def _build(n, L, optimized=True, av4=None, att_km=None):
             if exp_ == 'tiny':
                 a_['ntiles'] = 1
             if exp_ != 'none':
+                if os.environ.get('GPUPORT_ASM_SILU', '1') == '1':
+                    ops.asm_mm_silu(p, HB, T, Tp, a_, H2, Tp)          # silu fused into the matmul epilogue (GPUPORT_ASM_SILU=0 = separate op)
+                    return
                 ops.asm_mm(p, HB, T, Tp, a_, H2, Tp)
             ops.silu(p, lw_[key_]['n'] * Tp, H2, H2)
         else:
@@ -351,7 +393,10 @@ def _build(n, L, optimized=True, av4=None, att_km=None):
             ops.gemm_km(p, HB, T, Tp, lw_[key_], out_, Tp)
     def ASMRS(lw_, key_, li_, src_, scale_):   # matmul with the residual folded in (X += scale * result)
         if use_asm and os.environ.get('GPUPORT_ASM_RS', '1') == '1':
-            ops.asm_mm_rs(p, src_, T, Tp, L['asm'][li_][key_], X, Tp, scale_)
+            if use_asm4 and key_ in ASM4_KEYS:
+                ops.asm4_mm_rs(p, src_, T, Tp, L['asm4'][li_][key_], X, Tp, scale_, old=L['asm'][li_][key_])
+            else:
+                ops.asm_mm_rs(p, src_, T, Tp, L['asm'][li_][key_], X, Tp, scale_)
         else:
             ops.gemm_km(p, src_, T, Tp, lw_[key_], X, Tp, resid=scale_)
     p.marks = [('front_end', 0)]                    # op index where each stage starts (for profiling)
@@ -362,8 +407,18 @@ def _build(n, L, optimized=True, av4=None, att_km=None):
             G = ops.gemm_km; n_ = d * Tp
             ops.ln_km(p, T, d, Tp, X, HB, lw['n_ff1']); ASMFF(lw, 'ff1_1', li)
             ASMRS(lw, 'ff1_2', li, H2, 0.5)
-            ops.ln_km(p, T, d, Tp, X, HB, lw['n_att']); ASMROW(lw, 'qkv', li, QKV, 3 * d)
-            ops.attention_km(p, T, d, H, QKV, PE, lw['pos'], lw['pbu'], lw['pbv'], ATT, R, pos_tab=tab, att_pitch=Tp, qpu=att_qpu, pos_asm=(L['pos_asm'][li] if att_qpu and L.get('pos_asm') else None))
+            ops.ln_km(p, T, d, Tp, X, HB, lw['n_att'])
+            noprep = bool('QUK' in R and att_qpu and L.get('pos_asm') and L.get('pos_bias') and tab is not None and 'quk' in L['asm'][li]
+                          and os.environ.get('GPUPORT_ASM_ROW', '1') == '1' and os.environ.get('GPUPORT_ASM_NOPREP', '1') != '0')
+            if noprep:       # q (+ u, scaled) and k written k-major straight into the attention layout, v row-major where the pack step reads it
+                TPa = (T + 11) // 12 * 12
+                ops.asm_mm(p, HB, T, Tp, L['asm'][li]['quk'], R['QUK'], TPa)
+                ops.asm_mm_rm(p, HB, T, Tp, L['asm'][li]['vv'], QKV + 2 * d, 3 * d)
+                Ra = dict(R, QU=R['QUK'], QV=R['QUK'], KT=R['QUK'] + d * TPa)
+            else:
+                ASMROW(lw, 'qkv', li, QKV, 3 * d); Ra = R
+            ops.attention_km(p, T, d, H, QKV, PE, lw['pos'], lw['pbu'], lw['pbv'], ATT, Ra, pos_tab=tab, att_pitch=Tp, qpu=att_qpu, pos_asm=(L['pos_asm'][li] if att_qpu and L.get('pos_asm') else None),
+                             noprep=noprep, pos_bias=bool(L.get('pos_bias')))
             ASMRS(lw, 'out', li, ATT, 1.0)
             ops.ln_km(p, T, d, Tp, X, HB, lw['n_conv']); ASMPLAIN(lw, 'pw1', li, H2)
             if k <= 33:
@@ -399,7 +454,11 @@ def _build(n, L, optimized=True, av4=None, att_km=None):
         lin(p, H2, T, lw['ff2_2'], HB); ops.add(p, T * d, X, HB, 0.5)
         ops.ln(p, T, d, X, X, lw['n_out'])
     p.marks.append(('head', len(p.ops)))
-    if km:
+    if use_head_qpu:
+        NH = L['head_asm']['np_']
+        ops.asm_mm_rm(p, X, T, Tp, L['head_asm'], R['LOGP'], NH)
+        p.dispatch('repack_rows', 256, T * V1, [T, V1, NH, R['LOGP'], LOG])
+    elif km:
         ops.gemm_km(p, X, T, Tp, L['head'], LOG)
     else:
         lin(p, X, T, L['head'], LOG)
@@ -435,8 +494,8 @@ class Nemo8Encoder:
             j_ = json.load(open(lpath))
             # the blob file must be the one this layout was written with (tests and other tools also save work/nemo8_kit.bin: 2026-11-12 an
             # overwritten blob without the QPU weights made every transcript empty)
-            fresh = ('fe3' in j_ and j_.get('blob_floats') == os.path.getsize(wprefix + '.bin') // 4
-                     and (os.environ.get('GPUPORT_ASM') != '1' or ('asm' in j_ and 'pos_asm' in j_)))
+            fresh = ('fe3' in j_ and (j_.get('pos_tab') or {}).get('Tmax') == POS_TMAX and j_.get('blob_floats') == os.path.getsize(wprefix + '.bin') // 4
+                     and (os.environ.get('GPUPORT_ASM') != '1' or ('asm' in j_ and 'pos_asm' in j_ and j_.get('asm4') and j_.get('head_asm') and j_.get('pos_bias'))))
         if not fresh:                                         # also rebuilds a cache from before the position tables
             w, L = prepare(load_nemo_ref())
             w.save(wprefix)
