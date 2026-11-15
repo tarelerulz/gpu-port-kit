@@ -1,0 +1,17 @@
+#version 450
+// softmax over j for each (h, i) row of S, in place
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    uint T = p.u[0], H = p.u[2], SO = p.u[6];
+    if (id >= H * T) return;
+    uint base = SO + id * T;
+    float mx = -1e30;
+    for (uint j = 0u; j < T; j++) mx = max(mx, a[base + j]);
+    float sum = 0.0;
+    for (uint j = 0u; j < T; j++) { float e = exp(a[base + j] - mx); a[base + j] = e; sum += e; }
+    for (uint j = 0u; j < T; j++) a[base + j] /= sum;
+}

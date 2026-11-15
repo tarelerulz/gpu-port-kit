@@ -1,0 +1,16 @@
+#version 450
+// split the chunk QKV (n x 3d) into Q (n x d), and append K and V rows to the caches at row kofs.
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    uint n = p.u[0], d = p.u[1], qkvO = p.u[2], qO = p.u[3], kcO = p.u[4], vcO = p.u[5], kofs = p.u[6];
+    if (id >= n * 3u * d) return;
+    uint r = id / (3u * d), c = id % (3u * d);
+    float v = a[qkvO + r * 3u * d + c];
+    if (c < d) a[qO + r * d + c] = v;
+    else if (c < 2u * d) a[kcO + (kofs + r) * d + (c - d)] = v;
+    else a[vcO + (kofs + r) * d + (c - 2u * d)] = v;
+}

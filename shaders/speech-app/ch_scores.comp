@@ -1,0 +1,26 @@
+#version 450
+// chunk attention scores: S[h][r][k] = scale * (qu_r . K_k + qv_r . P[OMAX - (qabs_r - kabs_k)]),
+// qu = Q + pbu, qv = Q + pbv (per head). qabs = t0 + r, kabs = kbase + k. One invocation per (h, r, k).
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    uint n = p.u[0], NK = p.u[1], H = p.u[2], dh = p.u[3], d = p.u[4];
+    uint QO = p.u[5], KO = p.u[6], PO = p.u[7], SO = p.u[8], pbuO = p.u[9], pbvO = p.u[10];
+    uint t0 = p.u[11], kbase = p.u[12], OMAX = p.u[13], NP = p.u[14];
+    uint total = H * n * NK;
+    if (id >= total) return;
+    uint hh = id / (n * NK), rem = id % (n * NK), r = rem / NK, k = rem % NK;
+    int off = int(t0 + r) - int(kbase + k);
+    int prow = int(OMAX) - off;
+    float ac = 0.0, bd = 0.0;
+    bool ok = prow >= 0 && prow < int(NP);
+    for (uint e = 0u; e < dh; e++) {
+        float q = a[QO + r * d + hh * dh + e];
+        ac += (q + w[pbuO + hh * dh + e]) * a[KO + k * d + hh * dh + e];
+        if (ok) bd += (q + w[pbvO + hh * dh + e]) * a[PO + uint(prow) * d + hh * dh + e];
+    }
+    a[SO + (hh * n + r) * NK + k] = (ac + bd) * (1.0 / sqrt(float(dh)));
+}

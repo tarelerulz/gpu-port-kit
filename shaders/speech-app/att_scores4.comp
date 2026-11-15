@@ -1,0 +1,40 @@
+#version 450
+// scores S[h][i][j] = scale*(qu_i . k_j + qv_i . P[T-1-i+j]); one invocation per (h, i, 4 consecutive j).
+// vec4 loads (dh = 44 = 11 vec4; all row offsets are 4-aligned). q, pbu, pbv reused across the 4 j.
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(std430, binding = 0) buffer A4 { vec4 a4[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(std430, binding = 1) readonly buffer W4 { vec4 w4[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    uint T = p.u[0], d = p.u[1], H = p.u[2], dh = p.u[3];
+    uint qkvO = p.u[4], PO = p.u[5], SO = p.u[6], pbuO = p.u[7], pbvO = p.u[8];
+    uint JB = (T + 3u) / 4u;
+    uint total = H * T * JB;
+    if (id >= total) return;
+    uint hh = id / (T * JB), rem = id % (T * JB), i = rem / JB, jb = rem % JB;
+    float scale = 1.0 / sqrt(float(dh));
+    uint nv = dh / 4u;
+    uint qv0 = (qkvO + i * 3u * d + hh * dh) / 4u;
+    uint pbu4 = (pbuO + hh * dh) / 4u, pbv4 = (pbvO + hh * dh) / 4u;
+    vec4 qu[11], qv[11];
+    for (uint v = 0u; v < nv; v++) {
+        vec4 q = a4[qv0 + v];
+        qu[v] = q + w4[pbu4 + v];
+        qv[v] = q + w4[pbv4 + v];
+    }
+    for (uint jj = 0u; jj < 4u; jj++) {
+        uint j = jb * 4u + jj;
+        if (j >= T) break;
+        vec4 ac = vec4(0.0), bd = vec4(0.0);
+        uint kb4 = (qkvO + j * 3u * d + d + hh * dh) / 4u;
+        uint pb4 = (PO + (T - 1u - i + j) * d + hh * dh) / 4u;
+        for (uint v = 0u; v < nv; v++) {
+            ac += qu[v] * a4[kb4 + v];
+            bd += qv[v] * a4[pb4 + v];
+        }
+        a[SO + (hh * T + i) * T + j] = (ac.x + ac.y + ac.z + ac.w + bd.x + bd.y + bd.z + bd.w) * scale;
+    }
+}

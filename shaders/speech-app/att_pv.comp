@@ -1,0 +1,19 @@
+#version 450
+// out[i][h*dh+e] = sum_j Pr[h][i][j] * v[j][h*dh+e];  one invocation per (h, i, e)
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    uint T = p.u[0], d = p.u[1], H = p.u[2], dh = p.u[3];
+    uint qkvO = p.u[4], SO = p.u[6];
+    uint outO = p.u[9];
+    uint total = H * T * dh;
+    if (id >= total) return;
+    uint hh = id / (T * dh), rem = id % (T * dh), i = rem / dh, e = rem % dh;
+    float acc = 0.0;
+    uint sb = SO + (hh * T + i) * T;
+    for (uint j = 0u; j < T; j++) acc += a[sb + j] * a[qkvO + j * 3u * d + 2u * d + hh * dh + e];
+    a[outO + i * d + hh * dh + e] = acc;
+}

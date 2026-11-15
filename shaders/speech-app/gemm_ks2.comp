@@ -1,0 +1,49 @@
+#version 450
+// split-K small-M matmul with coalesced weights (layout [cg][j][k] of vec4). 64 threads share K; reduce in shared memory.
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(std430, binding = 1) readonly buffer W4 { vec4 w4[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+shared vec4 red[64][12];
+float epi(float v, uint op) {
+    if (op == 2u) return v / (1.0 + exp(-v));
+    if (op == 3u) return max(v, 0.0);
+    return v;
+}
+void main() {
+    uint M = p.u[0], N = p.u[1], K = p.u[2];
+    uint Ab = p.u[4], sAm = p.u[5], sAk = p.u[6], wo2 = p.u[7], bo = p.u[8], ob = p.u[9], sOm = p.u[10], sOn = p.u[11], epiOp = p.u[12];
+    uint cg = gl_WorkGroupID.x, q = gl_WorkGroupID.y, t = gl_LocalInvocationID.x;
+    uint m0 = q * 4u;
+    if (cg * 12u >= N || m0 >= M) return;
+    uint w4base = wo2 / 4u + cg * 3u * K;
+    uint am0 = Ab + min(m0, M - 1u) * sAm, am1 = Ab + min(m0 + 1u, M - 1u) * sAm;
+    uint am2 = Ab + min(m0 + 2u, M - 1u) * sAm, am3 = Ab + min(m0 + 3u, M - 1u) * sAm;
+    vec4 acc[12];
+    for (uint j = 0u; j < 12u; j++) acc[j] = vec4(0.0);
+    for (uint k = t; k < K; k += 64u) {
+        vec4 x = vec4(a[am0 + k * sAk], a[am1 + k * sAk], a[am2 + k * sAk], a[am3 + k * sAk]);
+        vec4 w0 = w4[w4base + k], w1 = w4[w4base + K + k], w2 = w4[w4base + 2u * K + k];
+        acc[0] += w0.x * x; acc[1] += w0.y * x; acc[2] += w0.z * x; acc[3] += w0.w * x;
+        acc[4] += w1.x * x; acc[5] += w1.y * x; acc[6] += w1.z * x; acc[7] += w1.w * x;
+        acc[8] += w2.x * x; acc[9] += w2.y * x; acc[10] += w2.z * x; acc[11] += w2.w * x;
+    }
+    for (uint j = 0u; j < 12u; j++) red[t][j] = acc[j];
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1) {
+        if (t < s) for (uint j = 0u; j < 12u; j++) red[t][j] += red[t + s][j];
+        barrier();
+    }
+    if (t == 0u) {
+        for (uint j = 0u; j < 12u; j++) {
+            uint nn = cg * 12u + j;
+            if (nn >= N) continue;
+            float bias = (bo == 0xffffffffu) ? 0.0 : w4[(bo + nn) / 4u][(bo + nn) % 4u];
+            vec4 r = red[0][j] + vec4(bias);
+            for (uint c = 0u; c < 4u; c++) {
+                if (m0 + c >= M) continue;
+                a[ob + (m0 + c) * sOm + nn * sOn] = epi(r[c], epiOp);
+            }
+        }
+    }
+}

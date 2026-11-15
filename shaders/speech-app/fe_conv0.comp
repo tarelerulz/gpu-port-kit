@@ -1,0 +1,24 @@
+#version 450
+// conv0: 3x3 stride 2 pad 1 over F[Tm][80] (1 input channel), + bias, relu. out C0[t2][f][ch], f in 0..39, ch < 176.
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    uint Tm = p.u[0], fO = p.u[1], oO = p.u[2], wO = p.u[3], bO = p.u[4], sc = p.u[5], T2 = p.u[6];
+    uint total = T2 * 40u * sc;
+    if (id >= total) return;
+    uint ch = id % sc, f = (id / sc) % 40u, t2 = id / (sc * 40u);
+    float acc = w[bO + ch];
+    for (uint dt = 0u; dt < 3u; dt++) {
+        int r = int(2u * t2) + int(dt) - 1;
+        if (r < 0 || r >= int(Tm)) continue;
+        for (uint df = 0u; df < 3u; df++) {
+            int c = int(2u * f) + int(df) - 1;
+            if (c < 0 || c >= 80) continue;
+            acc += w[wO + ch * 9u + dt * 3u + df] * a[fO + uint(r) * 80u + uint(c)];
+        }
+    }
+    a[oO + id] = max(acc, 0.0);
+}

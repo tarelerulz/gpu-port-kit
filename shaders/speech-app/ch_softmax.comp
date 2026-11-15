@@ -1,0 +1,17 @@
+#version 450
+// softmax over the NK keys for each (h, r) row, in place
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    uint n = p.u[0], NK = p.u[1], H = p.u[2], SO = p.u[8];
+    if (id >= H * n) return;
+    uint base = SO + id * NK;
+    float mx = -1e30;
+    for (uint k = 0u; k < NK; k++) mx = max(mx, a[base + k]);
+    float sum = 0.0;
+    for (uint k = 0u; k < NK; k++) { float e = exp(a[base + k] - mx); a[base + k] = e; sum += e; }
+    for (uint k = 0u; k < NK; k++) a[base + k] /= sum;
+}

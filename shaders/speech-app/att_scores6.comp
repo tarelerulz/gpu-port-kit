@@ -1,0 +1,44 @@
+#version 450
+// scores for 2 query rows (i, i+1) x 4 keys (j..j+3) per invocation; key vectors shared by the 2 rows.
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(std430, binding = 0) buffer A4 { vec4 a4[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(std430, binding = 1) readonly buffer W4 { vec4 w4[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    uint T = p.u[0], d = p.u[1], H = p.u[2], dh = p.u[3];
+    uint qkvO = p.u[4], PO = p.u[5], SO = p.u[6], pbuO = p.u[7], pbvO = p.u[8];
+    uint IB = (T + 1u) / 2u, JB = (T + 3u) / 4u;
+    uint total = H * IB * JB;
+    if (id >= total) return;
+    uint hh = id / (IB * JB), rem = id % (IB * JB), ib = rem / JB, jb = rem % JB;
+    uint i0 = ib * 2u, j0 = jb * 4u;
+    float scale = 1.0 / sqrt(float(dh));
+    uint nv = dh / 4u;
+    uint pbu4 = (pbuO + hh * dh) / 4u, pbv4 = (pbvO + hh * dh) / 4u;
+    uint ia = min(i0, T - 1u), ib2 = min(i0 + 1u, T - 1u);
+    uint qa4 = (qkvO + ia * 3u * d + hh * dh) / 4u, qb4 = (qkvO + ib2 * 3u * d + hh * dh) / 4u;
+    float ac[8], bd[8];
+    for (uint q = 0u; q < 8u; q++) { ac[q] = 0.0; bd[q] = 0.0; }
+    for (uint v = 0u; v < nv; v++) {
+        vec4 qa = a4[qa4 + v], qb = a4[qb4 + v];
+        vec4 qua = qa + w4[pbu4 + v], qub = qb + w4[pbu4 + v];
+        vec4 qva = qa + w4[pbv4 + v], qvb = qb + w4[pbv4 + v];
+        for (uint jj = 0u; jj < 4u; jj++) {
+            uint j = min(j0 + jj, T - 1u);
+            vec4 kv = a4[(qkvO + j * 3u * d + d + hh * dh) / 4u + v];
+            uint ra = min(T - 1u - ia + j, 2u * T - 2u), rb = min(T - 1u - ib2 + j, 2u * T - 2u);
+            vec4 pa = a4[(PO + ra * d + hh * dh) / 4u + v], pb = a4[(PO + rb * d + hh * dh) / 4u + v];
+            ac[jj] += dot(qua, kv);      bd[jj] += dot(qva, pa);
+            ac[4u + jj] += dot(qub, kv); bd[4u + jj] += dot(qvb, pb);
+        }
+    }
+    for (uint jj = 0u; jj < 4u; jj++) {
+        uint j = j0 + jj;
+        if (j >= T) continue;
+        if (i0 < T)       a[SO + (hh * T + i0) * T + j]       = (ac[jj] + bd[jj]) * scale;
+        if (i0 + 1u < T)  a[SO + (hh * T + i0 + 1u) * T + j]  = (ac[4u + jj] + bd[4u + jj]) * scale;
+    }
+}

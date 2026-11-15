@@ -1,0 +1,15 @@
+#version 450
+// chunk depthwise conv with fused SiLU: out[r][c] = silu(b[c] + sum_j wT[j][c] * seq[r+j][c])
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    uint n = p.u[0], d = p.u[1], k = p.u[2], seqO = p.u[3], outO = p.u[4], wO = p.u[5], bO = p.u[6];
+    if (id >= n * d) return;
+    uint r = id / d, c = id % d;
+    float acc = w[bO + c];
+    for (uint j = 0u; j < k; j++) acc += w[wO + j * d + c] * a[seqO + (r + j) * d + c];
+    a[outO + r * d + c] = acc / (1.0 + exp(-acc));
+}

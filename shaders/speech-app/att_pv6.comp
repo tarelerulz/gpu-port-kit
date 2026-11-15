@@ -1,0 +1,26 @@
+#version 450
+// out[i][h*dh + 4v..] for 2 rows i, i+1 per invocation (value chunk loaded once for both rows).
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(std430, binding = 0) buffer A4 { vec4 a4[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    uint T = p.u[0], d = p.u[1], H = p.u[2], dh = p.u[3];
+    uint qkvO = p.u[4], SO = p.u[6], outO = p.u[9];
+    uint nv = dh / 4u, IB = (T + 1u) / 2u;
+    uint total = H * IB * nv;
+    if (id >= total) return;
+    uint v = id % nv, rem = id / nv, hh = rem / IB, ib = rem % IB;
+    uint i0 = ib * 2u, i1 = min(i0 + 1u, T - 1u), ia = min(i0, T - 1u);
+    uint sa = SO + (hh * T + ia) * T, sb = SO + (hh * T + i1) * T;
+    vec4 accA = vec4(0.0), accB = vec4(0.0);
+    for (uint j = 0u; j < T; j++) {
+        vec4 vv = a4[(qkvO + j * 3u * d + 2u * d + hh * dh) / 4u + v];
+        accA += a[sa + j] * vv;
+        accB += a[sb + j] * vv;
+    }
+    if (i0 < T)       a4[(outO + i0 * d + hh * dh) / 4u + v] = accA;
+    if (i0 + 1u < T)  a4[(outO + (i0 + 1u) * d + hh * dh) / 4u + v] = accB;
+}

@@ -112,7 +112,7 @@ matmul still on the row-major path (pass `kscratch` to get about 5-6).
 - `python3 tools/nemo8_bench.py 3`: GPU vs CPU speed, writes GPU_NEMO8_BENCH.md.
 - `python3 tools/profile_nemo8.py clip10s`: per-dispatch GPU profile (needs tools/exec_prof).
 - `python3 tools/bench_gemm.py`: matmul kernels at nemo8 shapes (GPU_GEMM_BENCH.md).
-- `shaders/`: kit shaders (fe_frame_s, fe_conv0_v2, fe_im2col_v2, gemm12v), merged with the older speech-app and stream shaders (not in this repo, see "Paths you may need to set") by `merged_shader_dir()`.
+- `shaders/`: kit shaders (fe_frame_s, fe_conv0_v2, fe_im2col_v2, gemm12v), merged with the older speech-app and stream shaders (sources in `shaders/speech-app/`, see "Paths you may need to set") by `merged_shader_dir()`.
 
 ## Resident server
 - `gpuport/server.py`: `ExecServer(weights, shader_dir)` drives `exec_server2` (`runner/exec_server2.c`) (weights loaded once). Used by `tools/nemo8_bench.py`.
@@ -135,7 +135,7 @@ matmul still on the row-major path (pass `kscratch` to get about 5-6).
 
 ## Paths you may need to set
 Some code still defaults to the author's folder layout (`~/speech-app/...`, `~/opt/pios-vulkan`, `~/opt/mesa-v3dv`). On another machine:
-- `GPUPORT_SHADERS`: folder with the older speech-app `*.spv` shaders (not in this repo). The kit's own shaders are in `shaders/`.
+- `GPUPORT_SHADERS`: folder with the older speech-app `*.spv` shaders. Their sources are in `shaders/speech-app/`; build them with `sh tools/build_speech_app_shaders.sh` (needs `glslc`). If `~/speech-app/port/gpu` does not exist, the kit uses that build output (`work/speech-app-shaders`) by default. The kit's own shaders are in `shaders/`.
 - `GPUPORT_SPEECH_APP`: folder with the old speech-app `port/` files (`nemo_ref.py` is also in this repo under `port/`).
 - `GPUPORT_MODEL`: the nemo8 `.tnm` weights file.
 - `GPUPORT_LD_LIBRARY_PATH` and `GPUPORT_VK_ICD`: a Vulkan loader and v3dv driver folder, if the system ones are not enough. Without them the system Vulkan is used.
@@ -157,4 +157,5 @@ variables in `gpuport/config.py`. The tests that need them say so when the files
 - `patches/mesa/`: MIT, because it changes a Mesa file that is MIT-licensed.
 - `runner/exec.c` (the batch runner): MIT.
 - `shaders/common.glsl`, `shaders/specialization.glsl`, `shaders/gemm12.comp`: MIT (see `shaders/LICENSE-shaders`).
+- `shaders/speech-app/*.comp` (the older speech-app shaders, written by the author): MIT, same terms as `shaders/LICENSE-shaders`.
 - Not included: the model weights (linked above).

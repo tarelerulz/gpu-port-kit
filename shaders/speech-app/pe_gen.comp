@@ -1,0 +1,17 @@
+#version 450
+// relative positional encodings: row r holds position T-1-r; even column 2i = sin, odd 2i+1 = cos, div = 10000^(-2i/d)
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    uint T = p.u[0], d = p.u[1], peO = p.u[2];
+    uint NP = 2u * T - 1u;
+    if (id >= NP * d) return;
+    uint r = id / d, c = id % d, i = c / 2u;
+    float pos = float(int(T) - 1 - int(r));
+    float div = exp(-(2.0 * float(i)) * log(10000.0) / float(d));
+    float ang = pos * div;
+    a[peO + id] = (c % 2u == 0u) ? sin(ang) : cos(ang);
+}

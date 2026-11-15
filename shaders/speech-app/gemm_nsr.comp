@@ -1,0 +1,45 @@
+#version 450
+// gemm_ns + optional fused residual: if u[13] != 0xffffffff, out[row][n] = resid[row][n] + scale * act(v) (in place on u[13]).
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(std430, binding = 1) readonly buffer W4 { vec4 w4[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+float act(float v, uint op) {
+    if (op == 2u) return v / (1.0 + exp(-v));
+    if (op == 3u) return max(v, 0.0);
+    return v;
+}
+void store(uint idx, float v, uint op, uint rdst, float sc) {
+    if (rdst == 0xffffffffu) a[idx] = act(v, op);
+    else a[rdst + (idx - p.u[9])] += sc * act(v, op);
+}
+void main() {
+    uint M = p.u[0], N = p.u[1], K = p.u[2];
+    uint Ab = p.u[4], sAm = p.u[5], wo4 = p.u[7], bo = p.u[8], ob = p.u[9], sOm = p.u[10], epiOp = p.u[12];
+    uint rdst = p.u[13]; float sc = uintBitsToFloat(p.u[14]);
+    uint cg = gl_GlobalInvocationID.x, q = gl_WorkGroupID.y;
+    uint m0 = q * 4u;
+    if (cg * 4u >= N || m0 >= M) return;
+    uint wb = wo4 / 4u + cg * K;
+    uint am0 = Ab + min(m0, M - 1u) * sAm, am1 = Ab + min(m0 + 1u, M - 1u) * sAm;
+    uint am2 = Ab + min(m0 + 2u, M - 1u) * sAm, am3 = Ab + min(m0 + 3u, M - 1u) * sAm;
+    vec4 acc0 = vec4(0.0), acc1 = acc0, acc2 = acc0, acc3 = acc0;
+    for (uint k = 0u; k < K; k++) {
+        vec4 x = vec4(a[am0 + k], a[am1 + k], a[am2 + k], a[am3 + k]);
+        vec4 w = w4[wb + k];
+        acc0 += w.x * x; acc1 += w.y * x; acc2 += w.z * x; acc3 += w.w * x;
+    }
+    uint nn0 = cg * 4u;
+    float b0 = (bo == 0xffffffffu) ? 0.0 : w4[(bo + nn0) / 4u][(bo + nn0) % 4u];
+    float b1 = (bo == 0xffffffffu) ? 0.0 : w4[(bo + nn0 + 1u) / 4u][(bo + nn0 + 1u) % 4u];
+    float b2 = (bo == 0xffffffffu) ? 0.0 : w4[(bo + nn0 + 2u) / 4u][(bo + nn0 + 2u) % 4u];
+    float b3 = (bo == 0xffffffffu) ? 0.0 : w4[(bo + nn0 + 3u) / 4u][(bo + nn0 + 3u) % 4u];
+    for (uint c = 0u; c < 4u; c++) {
+        if (m0 + c >= M) continue;
+        uint row = ob + (m0 + c) * sOm;
+        if (nn0 < N) store(row + nn0, acc0[c] + b0, epiOp, rdst, sc);
+        if (nn0 + 1u < N) store(row + nn0 + 1u, acc1[c] + b1, epiOp, rdst, sc);
+        if (nn0 + 2u < N) store(row + nn0 + 2u, acc2[c] + b2, epiOp, rdst, sc);
+        if (nn0 + 3u < N) store(row + nn0 + 3u, acc3[c] + b3, epiOp, rdst, sc);
+    }
+}

@@ -1,0 +1,14 @@
+#version 450
+// flatten for the subsampling projection: FL[t3][ch*20 + f] = C2[(t3*20 + f)][ch]
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    uint T3 = p.u[0], sc = p.u[1], c2O = p.u[2], flO = p.u[3];
+    uint total = T3 * sc * 20u;
+    if (id >= total) return;
+    uint f = id % 20u, ch = (id / 20u) % sc, t3 = id / (20u * sc);
+    a[flO + id] = a[c2O + (t3 * 20u + f) * sc + ch];
+}

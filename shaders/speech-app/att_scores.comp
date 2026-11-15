@@ -1,0 +1,25 @@
+#version 450
+// scores S[h][i][j] = scale * (qu_i . k_j + qv_i . P[T-1-i+j]),  qu = q + pbu, qv = q + pbv (per head)
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    uint T = p.u[0], d = p.u[1], H = p.u[2], dh = p.u[3];
+    uint qkvO = p.u[4], PO = p.u[5], SO = p.u[6], pbuO = p.u[7], pbvO = p.u[8];
+    uint total = H * T * T;
+    if (id >= total) return;
+    uint hh = id / (T * T), rem = id % (T * T), i = rem / T, j = rem % T;
+    float scale = 1.0 / sqrt(float(dh));
+    float ac = 0.0, bd = 0.0;
+    uint qb = qkvO + i * 3u * d + hh * dh;
+    uint kb = qkvO + j * 3u * d + d + hh * dh;
+    uint pb = PO + (T - 1u - i + j) * d + hh * dh;
+    for (uint e = 0u; e < dh; e++) {
+        float q = a[qb + e];
+        ac += (q + w[pbuO + hh * dh + e]) * a[kb + e];
+        bd += (q + w[pbvO + hh * dh + e]) * a[pb + e];
+    }
+    a[SO + id] = (ac + bd) * scale;
+}
