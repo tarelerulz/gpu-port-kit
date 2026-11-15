@@ -1,0 +1,20 @@
+#version 450
+// patches for conv2: P[(t3*20+f3)][ch*9 + dt*3 + df] = C0[2*t3+dt-1][2*f3+df-1][ch] (zero outside). C0 is [T2][40][176].
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint id = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * 32768u * 64u;   /* 2-D dispatch: groups.x <= 32768 */
+    uint T3 = p.u[0], T2 = p.u[1], c0O = p.u[2], pO = p.u[3], sc = p.u[4];
+    uint K = sc * 9u;
+    uint total = T3 * 20u * K;
+    if (id >= total) return;
+    uint k = id % K, row = id / K;           /* row = t3*20 + f3 */
+    uint t3 = row / 20u, f3 = row % 20u;
+    uint ch = k / 9u, q = k % 9u, dt = q / 3u, df = q % 3u;
+    int r = int(2u * t3) + int(dt) - 1, c = int(2u * f3) + int(df) - 1;
+    float v = 0.0;
+    if (r >= 0 && r < int(T2) && c >= 0 && c < 40) v = a[c0O + (uint(r) * 40u + uint(c)) * sc + ch];
+    a[pO + id] = v;
+}

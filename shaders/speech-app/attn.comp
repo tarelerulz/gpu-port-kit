@@ -1,0 +1,41 @@
+#version 450
+// Relative-position MHSA, one invocation per (head, query row). Scores s(i,j) = scale * (qu_i . k_j + qv_i . P[T-1-i+j]),
+// softmax over j, output = sum_j p_j v_j. qkv rows are 3d wide (q, k, v); P has 2T-1 rows of d.
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    uint T = p.u[0], d = p.u[1], H = p.u[2], dh = p.u[3];
+    uint qkvO = p.u[4], PO = p.u[5], outO = p.u[6], pbuO = p.u[7], pbvO = p.u[8];
+    uint hh = id / T, i = id % T;
+    if (hh >= H) return;
+    float scale = 1.0 / sqrt(float(dh));
+    float qu[64], qv[64], acc[64];
+    for (uint e = 0u; e < dh; e++) {
+        qu[e] = a[qkvO + i * 3u * d + hh * dh + e] + w[pbuO + hh * dh + e];
+        qv[e] = a[qkvO + i * 3u * d + hh * dh + e] + w[pbvO + hh * dh + e];
+        acc[e] = 0.0;
+    }
+    float mx = -1e30;
+    for (uint j = 0u; j < T; j++) {
+        float ac = 0.0, bd = 0.0;
+        uint kb = qkvO + j * 3u * d + d + hh * dh;
+        uint pb = PO + (T - 1u - i + j) * d + hh * dh;
+        for (uint e = 0u; e < dh; e++) { ac += qu[e] * a[kb + e]; bd += qv[e] * a[pb + e]; }
+        mx = max(mx, (ac + bd) * scale);
+    }
+    float sum = 0.0;
+    for (uint j = 0u; j < T; j++) {
+        float ac = 0.0, bd = 0.0;
+        uint kb = qkvO + j * 3u * d + d + hh * dh;
+        uint pb = PO + (T - 1u - i + j) * d + hh * dh;
+        for (uint e = 0u; e < dh; e++) { ac += qu[e] * a[kb + e]; bd += qv[e] * a[pb + e]; }
+        float pw = exp((ac + bd) * scale - mx);
+        sum += pw;
+        uint vb = qkvO + j * 3u * d + 2u * d + hh * dh;
+        for (uint e = 0u; e < dh; e++) acc[e] += pw * a[vb + e];
+    }
+    for (uint e = 0u; e < dh; e++) a[outO + i * d + hh * dh + e] = acc[e] / sum;
+}

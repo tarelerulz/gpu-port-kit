@@ -1,0 +1,26 @@
+#version 450
+// out[i][h*dh + e] = sum_j S[h][i][j] * v[j][h*dh + e]; one invocation per (h, i), vec4 over e.
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(std430, binding = 0) buffer A4 { vec4 a4[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    uint T = p.u[0], d = p.u[1], H = p.u[2], dh = p.u[3];
+    uint qkvO = p.u[4], SO = p.u[6], outO = p.u[9];
+    uint total = H * T;
+    if (id >= total) return;
+    uint hh = id / T, i = id % T;
+    uint nv = dh / 4u;
+    vec4 acc[11];
+    for (uint v = 0u; v < nv; v++) acc[v] = vec4(0.0);
+    uint sb = SO + (hh * T + i) * T;
+    for (uint j = 0u; j < T; j++) {
+        float s = a[sb + j];
+        uint vb4 = (qkvO + j * 3u * d + 2u * d + hh * dh) / 4u;
+        for (uint v = 0u; v < nv; v++) acc[v] += s * a4[vb4 + v];
+    }
+    uint ob4 = (outO + i * d + hh * dh) / 4u;
+    for (uint v = 0u; v < nv; v++) a4[ob4 + v] = acc[v];
+}

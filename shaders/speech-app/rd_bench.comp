@@ -1,0 +1,20 @@
+#version 450
+// read-only benchmark: 64 threads per workgroup; each thread sums K elements.
+// mode 0: a[base + k]            (contiguous across k within a thread, stride 1)
+// mode 1: a[base + k * stride]   (thread-strided, stride = u[6])
+// mode 2: w4 vec4 at (k * stride4) (weights-like)
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(std430, binding = 1) readonly buffer W4 { vec4 w4[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint t = gl_LocalInvocationID.x, g = gl_WorkGroupID.x;
+    uint K = p.u[0], mode = p.u[1], stride = p.u[2], base = p.u[3], oo = p.u[4];
+    float s = 0.0;
+    for (uint k = t; k < K; k += 64u) {
+        if (mode == 0u) s += a[base + k];
+        else if (mode == 1u) s += a[base + k * stride];
+        else s += w4[base + k * stride].x;
+    }
+    if (t == 0u) a[oo + g] = s;
+}

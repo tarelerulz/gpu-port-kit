@@ -1,0 +1,13 @@
+#version 450
+// power spectrum: pw[k] = re[k]^2 + im[k]^2 for k in 0..256 (re, im are [T][257])
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    uint total = p.u[0] * 257u;
+    if (id >= total) return;
+    float re = a[p.u[1] + id], im = a[p.u[2] + id];
+    a[p.u[3] + id] = re * re + im * im;
+}

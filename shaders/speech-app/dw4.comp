@@ -1,0 +1,20 @@
+#version 450
+// Depthwise conv over time (centered, zero padded), 4 channels per invocation. Weights stored [k][d] (transposed).
+// out[t][c] = b[c] + sum_j wT[j][c] * in[t+j-h][c].  invocation: x = channel group (d/4), y = frame.
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer A4 { vec4 a4[]; };
+layout(std430, binding = 1) readonly buffer W4 { vec4 w4[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint c4 = gl_GlobalInvocationID.x, t = gl_GlobalInvocationID.y;
+    uint T = p.u[0], d = p.u[1], k = p.u[2], inO = p.u[3], outO = p.u[4], wO = p.u[5], bO = p.u[6];
+    uint d4 = d / 4u;
+    if (c4 >= d4 || t >= T) return;
+    int h = int(k / 2u);
+    vec4 acc = w4[bO / 4u + c4];
+    for (uint j = 0u; j < k; j++) {
+        int s = int(t) + int(j) - h;
+        if (s >= 0 && s < int(T)) acc += w4[wO / 4u + j * d4 + c4] * a4[(inO / 4u) + uint(s) * d4 + c4];
+    }
+    a4[(outO / 4u) + t * d4 + c4] = acc;
+}

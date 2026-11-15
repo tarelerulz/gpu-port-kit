@@ -1,0 +1,19 @@
+#version 450
+// per mel bin j: log(x + 5.96e-8), then per-feature normalization over the nvalid frames (ddof 1, +1e-5); row nvalid = 0.
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint j = gl_GlobalInvocationID.x;
+    uint nvalid = p.u[0], fO = p.u[1];      /* F[t][j] at fO + t*80 + j, t in 0..nvalid */
+    if (j >= 80u) return;
+    float s = 0.0;
+    for (uint t = 0u; t < nvalid; t++) { float v = log(a[fO + t * 80u + j] + 5.9604644775390625e-08); a[fO + t * 80u + j] = v; s += v; }
+    float mean = s / float(nvalid);
+    float vs = 0.0;
+    for (uint t = 0u; t < nvalid; t++) { float d = a[fO + t * 80u + j] - mean; vs += d * d; }
+    float sd = sqrt(vs / float(nvalid > 1u ? nvalid - 1u : 1u)) + 1e-5;
+    for (uint t = 0u; t < nvalid; t++) a[fO + t * 80u + j] = (a[fO + t * 80u + j] - mean) / sd;
+    a[fO + nvalid * 80u + j] = 0.0;
+}

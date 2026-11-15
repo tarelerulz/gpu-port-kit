@@ -1,0 +1,19 @@
+#version 450
+// Depthwise conv over time, centered, zero padded: out[t][c] = b[c] + sum_j w[c*k+j] * in[t+j-h][c], h = k/2.
+// invocation (x = channel, y = frame).
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint c = gl_GlobalInvocationID.x, t = gl_GlobalInvocationID.y;
+    uint T = p.u[0], d = p.u[1], k = p.u[2], inO = p.u[3], outO = p.u[4], wO = p.u[5], bO = p.u[6];
+    if (c >= d || t >= T) return;
+    int h = int(k / 2u);
+    float acc = w[bO + c];
+    for (uint j = 0u; j < k; j++) {
+        int s = int(t) + int(j) - h;
+        if (s >= 0 && s < int(T)) acc += w[wO + c * k + j] * a[inO + uint(s) * d + c];
+    }
+    a[outO + t * d + c] = acc;
+}

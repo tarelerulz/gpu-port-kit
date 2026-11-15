@@ -1,0 +1,20 @@
+#version 450
+// LayerNorm over rows: y[t][c] = (x - mean) / sqrt(var + 1e-5) * g[c] + b[c]. One invocation per row.
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint t = gl_GlobalInvocationID.x;
+    uint T = p.u[0], d = p.u[1], inO = p.u[2], outO = p.u[3], gO = p.u[4], bO = p.u[5];
+    if (t >= T) return;
+    float mean = 0.0;
+    for (uint c = 0; c < d; c++) mean += a[inO + t * d + c];
+    mean /= float(d);
+    float var = 0.0;
+    for (uint c = 0; c < d; c++) { float v = a[inO + t * d + c] - mean; var += v * v; }
+    var /= float(d);
+    float inv = 1.0 / sqrt(var + 1e-5);
+    for (uint c = 0; c < d; c++)
+        a[outO + t * d + c] = (a[inO + t * d + c] - mean) * inv * w[gO + c] + w[bO + c];
+}
