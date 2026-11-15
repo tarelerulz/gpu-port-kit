@@ -10,8 +10,10 @@ from nemo_ref import Blob
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODEL = os.environ.get('OIDO_MODEL', os.path.join(HERE, '..', 'models', 'nemo8.tnm'))   # the nemo8 weights file
 CACHE = os.path.join(HERE, 'cache2')
-GPU_DIR = os.environ.get('OIDO_GPU_DIR', os.path.join(HERE, 'gpu'))   # folder with the GPU server binary and its shaders
-SERVER = os.environ.get('OIDO_GPU_SERVER', os.path.join(GPU_DIR, 'exec_server'))
+KIT = os.path.dirname(HERE)
+# Folder with the shaders (*.spv): build it with tools/build_speech_app_shaders.sh. Server: tools/build_exec_server.sh.
+GPU_DIR = os.environ.get('OIDO_GPU_DIR', os.path.join(KIT, 'work', 'speech-app-shaders'))
+SERVER = os.environ.get('OIDO_GPU_SERVER', os.path.join(KIT, 'tools', 'exec_server_fixed'))
 ARENA_LIMIT = 24 << 20
 REGION_GAP = 131072   # gap after every arena region: a matmul output placed just below its input was read back wrong (2026-11-03)
 def roundup(a, b): return (a + b - 1) // b * b
@@ -178,7 +180,8 @@ class GpuEncoder2:
                     f.write(f"{name} {local} {gx} {gy} " + ' '.join(str(int(x)) for x in push[:32]) + '\n')
             arena_in.astype('<f4').tofile(base + '.arena')
             self.start()
-            self.proc.stdin.write(f"{base}.plan {base}.arena {base}.out {R['LOG']} {T * (L['V'] + 1)}\n"); self.proc.stdin.flush()
+            # exec_server2 request: plan, arena file, arena offset, out file, out offset, out count
+            self.proc.stdin.write(f"{base}.plan {base}.arena 0 {base}.out {R['LOG']} {T * (L['V'] + 1)}\n"); self.proc.stdin.flush()
             resp = self.proc.stdout.readline()
             if not resp.startswith('done'):
                 raise RuntimeError('gpu server: ' + resp.strip())

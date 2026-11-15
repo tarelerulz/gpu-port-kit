@@ -20,11 +20,11 @@ Needs: a Raspberry Pi 4 or 400 (V3D 4.2) running Linux with Vulkan (loader and t
 Measured on the author's Pi 400 (GPU at 700 MHz), 11 s JFK sample, same text in both modes: default 1.2 s, `GPUPORT_ASM=1` 0.7 s. The very first run after a start takes several seconds longer while pipelines compile.
 
 ## Oido port scripts (`port/`)
-These are older standalone scripts, kept for reference. The maintained path is `tools/transcribe.py`; `port/gpu_encoder2.py` was not working with the current runner in the 2026-11-14 test (`gpu server: err bad request`). `port/nemo_ref.py` reads the model file and is used by the kit.
+`port/gpu_encoder2.py` is the original, standalone version of the nemo8 GPU encoder: one file that builds the plan, talks to the resident server and decodes the text, with the first (slower) set of shaders and no QPU kernel. It works with the current runner (fixed 2026-11-14; `python3 port/gpu_encoder2.py clip.pcm`, raw 16 kHz int16; 11 s JFK sample correct in about 5 s of GPU time) but is kept for reference. Use `tools/transcribe.py` for real work: it is 4 to 7 times faster. `port/nemo_ref.py` reads the model file and is used by the kit.
 Settings (environment variables):
 - `OIDO_MODEL`: the nemo8 weights file (download from the Hugging Face links in "Model weights" below).
-- `OIDO_GPU_DIR`: folder with the GPU server binary `exec_server` and its shaders.
-- `OIDO_GPU_SERVER`: the server binary itself (default: `OIDO_GPU_DIR/exec_server`).
+- `OIDO_GPU_DIR`: folder with the shaders (default: `work/speech-app-shaders`, built by `tools/build_speech_app_shaders.sh`).
+- `OIDO_GPU_SERVER`: the server binary (default: `tools/exec_server_fixed`, built by `tools/build_exec_server.sh`).
 - `LD_LIBRARY_PATH`, `VK_ICD_FILENAMES`: the Vulkan loader and driver (see the quick start).
 
 The resident server source is in `runner/exec_server2.c`; build it with `sh tools/build_exec_server.sh` (it creates `tools/exec_server_fixed`; point `OIDO_GPU_SERVER` at it). The weights are not included.
