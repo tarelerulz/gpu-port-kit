@@ -1,7 +1,7 @@
 """Hybrid (QPU matmuls) vs reference plan at many clip lengths: same tokens, argmax, logit diff, time. 2026-11-12."""
 import os, sys
 import numpy as np
-KIT = '/home/tarel/gpu-port-kit'; sys.path.insert(0, KIT)
+KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__))); sys.path.insert(0, KIT)
 os.environ['GPUPORT_ASM'] = '1'
 from gpuport.nemo8 import load_nemo_ref, prepare, build, collapse, SPEECH_APP, SHADERS
 from gpuport.server import ExecServer

@@ -5,7 +5,7 @@ usage: PYTHONPATH=<py-videocore6>/src python3 check1.py [rounds] [nadd]"""
 import fcntl, os, socket, struct, subprocess, sys, time
 import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-KIT = '/home/tarel/gpu-port-kit'
+KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, KIT)
 import mm_asm as M
 from videocore6.driver import Driver

@@ -1,7 +1,7 @@
 """Hybrid vs the Mesa plan on f16-ROUNDED weights (same rounding the QPU kernels use): if these agree, the QPU path is exact and larger differences to the f32 plan come from weight rounding."""
 import os, sys
 import numpy as np
-KIT = '/home/tarel/gpu-port-kit'; sys.path.insert(0, KIT)
+KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__))); sys.path.insert(0, KIT)
 os.environ['GPUPORT_ASM'] = '1'; os.environ['GPUPORT_ASM_GATE'] = 'off'
 from gpuport import weights as wmod, ops
 from gpuport.nemo8 import load_nemo_ref, prepare, build, SPEECH_APP, SHADERS
