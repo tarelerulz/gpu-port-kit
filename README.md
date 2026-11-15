@@ -3,21 +3,24 @@
 Helpers for porting models to the Pi's GPU, measured on the Oido speech model (nemo8) and the asr4all port. The method and the measured rules are in `GPU_MAP.md`, `V3D_FINDINGS.md` and `OIDO_GPU_STORY.md`.
 The kit wraps the `exec` batch runner in `runner/exec.c` (one command buffer, barrier after each dispatch).
 
-**Status:** this is research code from one Pi 400, not a packaged install. The building blocks (runner, shaders, checks, hand-written QPU matmul) are here and the write-ups explain them. Running the full nemo8 speech model end to end also needs the model weights (see "Model weights" below) and some local paths set (see "Paths you may need to set"). It has not been tested from a fresh clone on a clean machine.
+**Status:** research code from one Pi 400, not a packaged install. On 2026-11-14 the steps below were run from a fresh clone (with `HOME` pointed at an empty folder so that none of the author's files were used): all kit checks pass and the nemo8 model transcribes the public JFK sample correctly on the GPU. The Vulkan loader and driver folders were still the author's, passed by environment variable; a stock Raspberry Pi OS install was not tested.
 It does not replace the method; it makes each step quick and enforces the rules.
 
 ## Quick start
-Needs: a Raspberry Pi 4 or 400 (V3D 4.2) running Linux with a Vulkan loader and the broadcom
-driver, `glslc` (shader compiler), Python 3 with numpy, and a C compiler with the Vulkan headers.
+Needs: a Raspberry Pi 4 or 400 (V3D 4.2) running Linux with Vulkan (loader and the v3dv driver; the patched Mesa in `patches/` adds hang reporting), `glslc`, Python 3 with numpy, and a C compiler with the Vulkan and libdrm headers.
 
-1. Build the batch runner: `sh tools/build_exec_big.sh` (builds `tools/exec_big` from `runner/exec.c`).
-2. Point the kit at a Vulkan driver in `gpuport/config.py` (`VK_ENV`). Use the patched driver from
-   `patches/` for hang reporting.
-3. Run `python3 tests/check_runner.py` first. It fails if the runner or driver is broken.
-4. Run `python3 tests/run_all.py` for the full set. The nemo8 test needs the weights (see below).
+1. Build the runners and the older shaders:
+   `sh tools/build_exec_big.sh && sh tools/build_exec_server.sh && sh tools/build_exec_hybrid.sh && sh tools/build_speech_app_shaders.sh`
+2. If your Vulkan loader or driver is not the system one, set `GPUPORT_LD_LIBRARY_PATH` and `GPUPORT_VK_ICD` (see "Paths you may need to set").
+3. Get the nemo8 weights (see "Model weights" below) and set `GPUPORT_MODEL=/path/to/nemo8.tnm`.
+4. Check the runner: `python3 tests/check_runner.py`.
+5. Run everything: `python3 tests/run_all.py` (about 2 minutes). It ends with `ALL KIT CHECKS PASS`. One check, `tests/nemo8_rebuild.py`, needs the author's private reference files and is skipped.
+6. Transcribe a clip: `python3 tools/transcribe.py clip.wav` (16 kHz mono 16-bit WAV, or raw `.pcm`). Add `GPUPORT_ASM=1` for the hand-written QPU matmul (needs the `exec_hybrid` build from step 1).
+
+Measured on the author's Pi 400 (GPU at 700 MHz), 11 s JFK sample, same text in both modes: default 1.2 s, `GPUPORT_ASM=1` 0.7 s. The very first run after a start takes several seconds longer while pipelines compile.
 
 ## Oido port scripts (`port/`)
-`port/gpu_encoder2.py` runs the nemo8 speech model on the Pi GPU (front end included). `port/nemo_ref.py` reads the model file.
+These are older standalone scripts, kept for reference. The maintained path is `tools/transcribe.py`; `port/gpu_encoder2.py` was not working with the current runner in the 2026-11-14 test (`gpu server: err bad request`). `port/nemo_ref.py` reads the model file and is used by the kit.
 Settings (environment variables):
 - `OIDO_MODEL`: the nemo8 weights file (download from the Hugging Face links in "Model weights" below).
 - `OIDO_GPU_DIR`: folder with the GPU server binary `exec_server` and its shaders.
@@ -25,7 +28,6 @@ Settings (environment variables):
 - `LD_LIBRARY_PATH`, `VK_ICD_FILENAMES`: the Vulkan loader and driver (see the quick start).
 
 The resident server source is in `runner/exec_server2.c`; build it with `sh tools/build_exec_server.sh` (it creates `tools/exec_server_fixed`; point `OIDO_GPU_SERVER` at it). The weights are not included.
-Tested: `GpuEncoder2` gives the same logits as the original oido copy on the same 5-second clip (max difference 0).
 
 ## Map of the GPU
 - `OIDO_GPU_STORY.md`: the whole history of the Oido port in plain words (3.3 s -> 0.54 s for 10 s of speech), what worked and what did not.
