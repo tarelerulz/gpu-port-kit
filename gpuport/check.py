@@ -44,3 +44,65 @@ def bisect(label, plan, arena_init, checkpoints, weights=None, **kw):
             print(f'     first wrong stage: {name}; check the op that produced it and its inputs')
             break
     return first_bad
+
+
+# Guard value for memory checks: finite, never produced by a model, compared bit for bit.
+CANARY = np.float32(-7.7771e33)
+
+
+def guard_run(label, plan, arena, inputs, writes, scratch=(), weights=None, poison=False, runner=None, **kw):
+    """Run a plan and check WHERE it wrote, not only what (added 2026-11-12).
+    arena: the Arena object. inputs: {region name: array}. writes: regions the plan must fill completely.
+    scratch: regions the plan may write in part (temporaries, padded rows).
+    Everything else (other regions, every gap, the unfilled tail of an input region) is filled with CANARY
+    and must come back bit-identical. Catches the three bugs from the notes: rows written past the end of an
+    output (runner bug 2026-11-05), a scratch buffer on top of live data (2026-11-09), and outputs that were
+    never computed (rows 256+).
+    poison=True fills the guard areas with NaN instead, so a READ outside the inputs shows up as NaN in the
+    output (shaders that load padding on purpose and discard it stay clean; ones that use it do not).
+    runner: optional callable(plan, full_arena, out_off, out_n) -> (out, ms), e.g. ExecServer.run.
+    Returns (ok, {name: array for writes + scratch}, problems list)."""
+    size = arena.used()
+    guard = np.float32(np.nan) if poison else CANARY
+    full = np.full(size, guard, np.float32)
+    for name, val in inputs.items():
+        val = np.asarray(val, np.float32).ravel()
+        o, n = arena.regions[name]
+        if val.size > n:
+            raise ValueError(f'input {name}: {val.size} floats > region {n}')
+        full[o:o + val.size] = val
+    before = full.view(np.uint32).copy()
+    if runner is not None:
+        got, ms = runner(plan, full, 0, size)
+    else:
+        got, ms = run(plan, full, 0, size, weights=weights, **kw)
+    gb = got.view(np.uint32)
+    may_write = np.zeros(size, bool)
+    problems, out = [], {}
+    for name in list(writes) + list(scratch):
+        o, n = arena.regions[name]
+        may_write[o:o + n] = True
+        out[name] = got[o:o + n].copy()
+    stray = np.flatnonzero((gb != before) & ~may_write)
+    if stray.size:
+        runs = np.split(stray, np.flatnonzero(np.diff(stray) != 1) + 1)
+        for r in runs[:5]:
+            problems.append(f'wrote outside its regions: {r.size} floats at {arena.where(int(r[0]))} '
+                            f'(offset {int(r[0])}..{int(r[-1])})')
+        if len(runs) > 5:
+            problems.append(f'... and {len(runs) - 5} more stray ranges ({stray.size} floats in total)')
+    gbits = np.float32(guard).view(np.uint32)
+    for name in writes:
+        o, n = arena.regions[name]
+        if name in inputs:
+            continue                               # in-place: cannot tell written from kept
+        left = np.flatnonzero(gb[o:o + n] == gbits) if not poison else np.flatnonzero(np.isnan(got[o:o + n]))
+        if left.size:
+            problems.append(f'{name}: {left.size} of {n} floats never written'
+                            f'{" (or NaN)" if poison else ""}, first at {name}+{int(left[0])}')
+    ok = not problems
+    print(f'{"ok  " if ok else "FAIL"} {label}: memory guard ({"NaN poison" if poison else "canary"}), '
+          f'{size} floats, gpu {ms:.1f} ms')
+    for p in problems:
+        print('     ' + p)
+    return ok, out, problems

@@ -1,0 +1,16 @@
+#version 450
+// Mel rows regrouped for conv0 as a matmul (2026-11-12). Z[col][c][t3] = MEL[4*t3 + c - 4][col - 1], zero outside
+// (rows < 0 or >= Tm, col 0 and 81 = the conv padding). Rows of pitch TP, t3 contiguous; col in 0..81, c in 0..7.
+// u: 0 Tm, 1 TP, 2 MEL ([Tm][80]), 3 Z
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint idx = gl_GlobalInvocationID.x, TP = p.u[1];
+    if (idx >= 82u * 8u * TP) return;
+    uint t3 = idx % TP, rc = idx / TP, c = rc % 8u, col = rc / 8u;
+    int r = int(4u * t3 + c) - 4;
+    float v = 0.0;
+    if (r >= 0 && r < int(p.u[0]) && col >= 1u && col <= 80u) v = a[p.u[2] + uint(r) * 80u + col - 1u];
+    a[p.u[3] + idx] = v;
+}

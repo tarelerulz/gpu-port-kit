@@ -1,0 +1,12 @@
+#version 450
+// Row-major [M][N] with row pitch SP -> [M][N] contiguous (head logits from the QPU row-major kernel, N padded to a tile multiple).
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint M = p.u[0], N = p.u[1], SP = p.u[2], src = p.u[3], dst = p.u[4];
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= M * N) return;
+    uint m = idx / N, n = idx % N;
+    a[dst + idx] = a[src + m * SP + n];
+}

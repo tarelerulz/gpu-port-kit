@@ -1,0 +1,22 @@
+gemm12av4.spv:   glslc --target-env=vulkan1.1 -O -DAV4=1 -I shaders gemm12.comp -o gemm12av4.spv
+gemm12av4o4.spv: glslc --target-env=vulkan1.1 -O -DAV4=1 -DOV4=2 -I shaders gemm12.comp -o gemm12av4o4.spv
+tr_km.spv:       glslc --target-env=vulkan1.1 -O -I shaders tr_km.comp -o tr_km.spv
+gemm12av4*.comp are copies of gemm12.comp (the flags select the variant); tr_km.comp transposes A to k-major.
+2026-11-12 (attention on the matmul kernel), same glslc line, flags:
+gemm12av4o1.spv: -DAV4=1 -DOV4=1          (k-major input, output stored [n][m], m contiguous)
+gemm12wa1.spv:   -DAV4=1 -DOV4=1 -DWA=1   (right-hand matrix read from the arena, row pitch u[21])
+gemm12wa2.spv:   -DAV4=1 -DOV4=2 -DWA=1
+att_prep.spv, att_comb.spv, att_softmax_t.spv: no flags.
+gemm12wp1.spv:   -DAV4=1 -DOV4=1 -DWP=1   (weights matrix with its own row pitch u[21]: cached position tables)
+ln_km.spv, glu_km.spv, dw_km.spv: no flags (k-major layer, 2026-11-12).
+ln_km4.spv, glu_kmh.spv, dw_km4.spv, att_softmax_t4.spv: no flags (4 frames per thread, 2026-11-12).
+gemm12av4rs.spv: -DAV4=1 -DOV4=1 -DRS=1   (residual folded in: out += scale * result)
+fe_phase.spv, fe_c0fix.spv: no flags (front-end convs as matmuls, 2026-11-12).
+2026-11-12 (UA): all gemm12av4*/wa/wp/rs binaries above are now built with an extra -DUA=1 (unsigned k-major input address, no signed divide per K step).
+2026-11-12 (two-stage DFT, fe3): fe_frame_k.spv, fe_tw.spv, fe_pw2.spv: no flags, local 256 (glslc --target-env=vulkan1.1 -O -I shaders X.comp -o X.spv).
+2026-11-12 (batch, -DBATCH=1 -DUA=1): gemm12av4o1b (AV4 OV4=1), gemm12wa1b (+WA), gemm12wp1b (+WP), gemm12wa2b (OV4=2 +WA). Workgroup y = batch;
+  push u[22] A stride, u[23] out stride, u[24] W stride (WA/WP), floats per batch. Copies of gemm12.comp as gemm12*b.comp.
+repack_rows.spv: no flags (2026-11-13: head logits pitch 1040 -> contiguous)
+att_softmax_so.spv: no flags (2026-11-13: online softmax, skew layout)
+2026-11-13: ln_km4, dw_km4, glu_kmh, att_softmax_sk/so/t4 rebuilt with -DLS=16 (local_size_x 16: spreads the few threads over all QPUs); originals in shaders/bak-2026-11-13-ls/
+ln_st.spv, ln_nm.spv: no flags (2026-11-13: layer norm split into stats + normalize dispatches)

@@ -1,10 +1,10 @@
-"""Run every kit check on the GPU: selftest (ops), weight layouts, attention layout. Exit 1 on any failure.
+"""Run every kit check on the GPU: selftest (ops), memory guard, weight layouts, attention layout. Exit 1 on any failure.
 usage: python3 ~/gpu-port-kit/tests/run_all.py"""
 import os
 import subprocess
 import sys
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-steps = [['tests/check_runner.py'], ['selftest.py'], ['tests/test_weight_layouts.py'], ['tests/test_attention_layout.py'], ['tests/nemo8_rebuild.py']]
+steps = [['tests/check_runner.py'], ['selftest.py'], ['tests/test_memory_guard.py'], ['tests/test_weight_layouts.py'], ['tests/test_attention_layout.py'], ['tests/test_attention_km.py'], ['tests/nemo8_rebuild.py'], ['tests/nemo8_guard.py'], ['tests/nemo8_lengths.py']]
 bad = []
 for s in steps:
     r = subprocess.run([sys.executable, os.path.join(KIT, s[0])], cwd=KIT, capture_output=True, text=True)

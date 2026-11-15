@@ -1,0 +1,15 @@
+#version 450
+// Power spectrum from the stage-2 output O[k2 * 2 + c][t * 16 + k1] (pitch Mp2), bin k = k1 + 16 * k2 -> pw[t * 257 + k].
+// u: 0 Tm, 1 O, 2 Mp2, 3 PW
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    uint Tm = p.u[0], oO = p.u[1], Mp2 = p.u[2], pO = p.u[3];
+    if (id >= Tm * 257u) return;
+    uint t = id / 257u, k = id % 257u, k1 = k & 15u, k2 = k >> 4u;
+    uint m = t * 16u + k1;
+    float re = a[oO + (2u * k2) * Mp2 + m], im = a[oO + (2u * k2 + 1u) * Mp2 + m];
+    a[pO + id] = re * re + im * im;
+}

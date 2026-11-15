@@ -1,0 +1,40 @@
+#version 450
+// LayerNorm normalize, split over channel chunks (2026-11-13): one thread per (frame quad, 16 channels). Reads the partial sums of ln_st.
+// u: 0 T, 1 d, 2 TP, 3 in, 4 out, 5 gamma (weights), 6 beta (weights), 7 scratch
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer A4 { vec4 a4[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    uint T = p.u[0], d = p.u[1], ts = p.u[2] / 4u, NC = d / 16u, q = id / NC, cc = id % NC;
+    if (q * 4u >= T) return;
+    uint i4 = p.u[3] / 4u + q, o4 = p.u[4] / 4u + q, gO = p.u[5], bO = p.u[6], S = p.u[7] / 4u + q * 9u, c = cc * 16u;
+    vec4 sm = (a4[S] + a4[S + 2u]) + (a4[S + 4u] + a4[S + 6u]);
+    vec4 sq = (a4[S + 1u] + a4[S + 3u]) + (a4[S + 5u] + a4[S + 7u]);
+    vec4 c0 = a4[S + 8u];
+    vec4 x0 = a4[i4 + c * ts], x1 = a4[i4 + (c + 1u) * ts], x2 = a4[i4 + (c + 2u) * ts], x3 = a4[i4 + (c + 3u) * ts];
+    vec4 x4 = a4[i4 + (c + 4u) * ts], x5 = a4[i4 + (c + 5u) * ts], x6 = a4[i4 + (c + 6u) * ts], x7 = a4[i4 + (c + 7u) * ts];
+    vec4 y0 = a4[i4 + (c + 8u) * ts], y1 = a4[i4 + (c + 9u) * ts], y2 = a4[i4 + (c + 10u) * ts], y3 = a4[i4 + (c + 11u) * ts];
+    vec4 y4 = a4[i4 + (c + 12u) * ts], y5 = a4[i4 + (c + 13u) * ts], y6 = a4[i4 + (c + 14u) * ts], y7 = a4[i4 + (c + 15u) * ts];
+    vec4 dm = sm / float(d);
+    vec4 mean = c0 + dm;
+    vec4 var = max(sq / float(d) - dm * dm, vec4(0.0));
+    vec4 inv = 1.0 / sqrt(var + 1e-5);
+    a4[o4 + c * ts] = (x0 - mean) * inv * w[gO + c] + w[bO + c];
+    a4[o4 + (c + 1u) * ts] = (x1 - mean) * inv * w[gO + c + 1u] + w[bO + c + 1u];
+    a4[o4 + (c + 2u) * ts] = (x2 - mean) * inv * w[gO + c + 2u] + w[bO + c + 2u];
+    a4[o4 + (c + 3u) * ts] = (x3 - mean) * inv * w[gO + c + 3u] + w[bO + c + 3u];
+    a4[o4 + (c + 4u) * ts] = (x4 - mean) * inv * w[gO + c + 4u] + w[bO + c + 4u];
+    a4[o4 + (c + 5u) * ts] = (x5 - mean) * inv * w[gO + c + 5u] + w[bO + c + 5u];
+    a4[o4 + (c + 6u) * ts] = (x6 - mean) * inv * w[gO + c + 6u] + w[bO + c + 6u];
+    a4[o4 + (c + 7u) * ts] = (x7 - mean) * inv * w[gO + c + 7u] + w[bO + c + 7u];
+    a4[o4 + (c + 8u) * ts] = (y0 - mean) * inv * w[gO + c + 8u] + w[bO + c + 8u];
+    a4[o4 + (c + 9u) * ts] = (y1 - mean) * inv * w[gO + c + 9u] + w[bO + c + 9u];
+    a4[o4 + (c + 10u) * ts] = (y2 - mean) * inv * w[gO + c + 10u] + w[bO + c + 10u];
+    a4[o4 + (c + 11u) * ts] = (y3 - mean) * inv * w[gO + c + 11u] + w[bO + c + 11u];
+    a4[o4 + (c + 12u) * ts] = (y4 - mean) * inv * w[gO + c + 12u] + w[bO + c + 12u];
+    a4[o4 + (c + 13u) * ts] = (y5 - mean) * inv * w[gO + c + 13u] + w[bO + c + 13u];
+    a4[o4 + (c + 14u) * ts] = (y6 - mean) * inv * w[gO + c + 14u] + w[bO + c + 14u];
+    a4[o4 + (c + 15u) * ts] = (y7 - mean) * inv * w[gO + c + 15u] + w[bO + c + 15u];
+}

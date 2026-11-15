@@ -45,3 +45,18 @@ def lin_i8(plan, q_off, s_off, M, mm, out_off, epi=0):
     total = (NP // 12) * RG
     return plan.dispatch('gemm_i8', 256, total,
                          [M, mm['n'], mm['kq'], NP, q_off, s_off, 0, mm['wo'], mm['bo'], out_off, mm['n'], 0, epi, mm['sw']])
+
+
+def quant_op_km(plan, in_off, M, K, sIn, q_off, s_off):
+    """quant_op with k-major packed output (shaders/quant_rows_km.comp, 2026-11-09): word kq of row m at
+    q_off + kq*Mp + m, Mp = M rounded up to 4. Needs q_off room for (K/4) * Mp words."""
+    Mp = (M + 3) // 4 * 4
+    return plan.dispatch('quant_rows_km', 64, M, [M, K, in_off, sIn, q_off, s_off, Mp])
+
+
+def lin_i8_km(plan, q_off, s_off, M, mm, out_off, epi=0):
+    """lin_i8 reading the k-major packed activations from quant_op_km (shaders/gemm_i8km.comp)."""
+    NP = mm['np']; RG = (M + 3) // 4; Mp = RG * 4
+    total = (NP // 12) * RG
+    return plan.dispatch('gemm_i8km', 256, total,
+                         [M, mm['n'], mm['kq'], NP, q_off, s_off, Mp, mm['wo'], mm['bo'], out_off, mm['n'], 0, epi, mm['sw']])

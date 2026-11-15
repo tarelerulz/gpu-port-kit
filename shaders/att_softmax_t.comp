@@ -1,0 +1,18 @@
+#version 450
+// Softmax over j for each (h, i), in place, scores stored [h][j][i] with pitch TP (2026-11-12).
+// Neighbouring threads (i, i+1) read neighbouring addresses. u: 0 T, 1 H, 2 TP, 3 ST
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint T = p.u[0], H = p.u[1], TP = p.u[2], id = gl_GlobalInvocationID.x;
+    if (id >= H * T) return;
+    uint h = id / T, i = id % T;
+    uint base = p.u[3] + h * T * TP + i;
+    float mx = -1e30;
+    for (uint j = 0u; j < T; j++) mx = max(mx, a[base + j * TP]);
+    float sum = 0.0;
+    for (uint j = 0u; j < T; j++) { float e = exp(a[base + j * TP] - mx); a[base + j * TP] = e; sum += e; }
+    float inv = 1.0 / sum;
+    for (uint j = 0u; j < T; j++) a[base + j * TP] *= inv;
+}

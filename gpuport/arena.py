@@ -34,3 +34,17 @@ class Arena:
 
     def used(self):
         return self.cur
+
+    def where(self, off):
+        """Name the place of a float offset: 'X+12' inside region X, 'gap after X+5', or 'beyond arena'."""
+        last = None
+        for name, (o, n) in sorted(self.regions.items(), key=lambda kv: kv[1][0]):
+            if off < o:
+                break
+            last = (name, o, n)
+        if last is None:
+            return f'before first region (+{off})'
+        name, o, n = last
+        if off < o + n:
+            return f'{name}+{off - o}'
+        return f'gap after {name}+{off - o - n}' if off < self.cur else f'beyond arena (+{off - self.cur})'

@@ -52,6 +52,28 @@ def test_gemm12():
         allok &= ok
 
 
+def test_gemm12_kscratch():
+    """gemm12 through the k-major path (tr_km + gemm12av4 / gemm12av4o4), vs numpy."""
+    global allok
+    for M, K, N, epi, stride in [(37, 52, 20, 0, 52), (37, 52, 20, 2, 52),
+                                  (300, 64, 40, 0, 64), (300, 64, 33, 0, 64),
+                                  (77, 512, 257, 0, 516), (300, 257, 80, 0, 261)]:
+        A = rng.standard_normal((M, K)).astype(np.float32)
+        Wm = rng.standard_normal((N, K)).astype(np.float32) * 0.2
+        b = rng.standard_normal(N).astype(np.float32)
+        w = Weights(); mm = w.put_mm(Wm, b)
+        wpath = w.save(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'work', 'gemm_test'))
+        ar = Arena(); ia = ar.alloc('A', M * stride); io = ar.alloc('O', M * N); ik = ar.alloc('TK', K * 252)
+        arena = np.zeros(ar.used(), np.float32); padded = np.full((M, stride), np.nan, np.float32)
+        padded[:, :K] = A
+        arena[ia:ia + M * stride] = padded.ravel()
+        p = Plan(); ops.gemm12(p, ia, M, mm, io, epi=epi, sAm=stride, kscratch=ik)
+        assert any(op.shader.startswith('gemm12av4') for op in p.ops)
+        ok, _ = check.op_test(f'gemm12 kscratch M={M} K={K} N={N} stride={stride} epi={epi} ({len(p)} ops)', p, arena, io,
+                              gemm_ref(A, Wm, b, epi), 1e-3, weights=wpath)
+        allok &= ok
+
+
 def test_bisect_and_lint():
     global allok
     n = 512
@@ -74,6 +96,15 @@ def test_bisect_and_lint():
     allok &= any('local' in e for e in errs)
 
 
+    # lint must warn about a power-of-two row stride on a row-major matmul (7x slower at 512, GPU_MAP section 10)
+    w = Weights(); mm = w.put_mm(np.zeros((12, 512), np.float32))
+    slow = ops.gemm12(Plan(), 0, 8, mm, 600000, sAm=512)
+    fine = ops.gemm12(Plan(), 0, 8, mm, 600000, sAm=516)
+    hit = any('power-of-two' in m for _, m in slow.lint(SHADER_DIR)) and not any('power-of-two' in m for _, m in fine.lint(SHADER_DIR))
+    print('lint warns about a 512 row stride (and not 516):', hit)
+    allok &= hit
+
+
 def test_timing():
     n = 16384
     ar = Arena(); a = ar.alloc('a', n); b = ar.alloc('b', n)
@@ -85,6 +116,7 @@ def test_timing():
 if __name__ == '__main__':
     test_add_silu()
     test_gemm12()
+    test_gemm12_kscratch()
     test_bisect_and_lint()
     if '--timing' in sys.argv:
         test_timing()

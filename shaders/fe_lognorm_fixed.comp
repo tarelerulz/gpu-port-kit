@@ -1,0 +1,19 @@
+#version 450
+// oido streaming front end: log(F + 5.96e-8), then FIXED per-bin normalization (nmean, nstd from the model file).
+// Rows t < nrows (push u[0]) at fO + t*80 + j. If u[2] == 1, row nrows is set to zero (end of utterance, like logmel()).
+// Weights: nmean at mO, nstd at sO (offsets in the kit weights blob).
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint j = gl_GlobalInvocationID.x;
+    uint nrows = p.u[0], fO = p.u[1], zero_row = p.u[2], mO = p.u[3], sO = p.u[4];
+    if (j >= 80u) return;
+    float m = w[mO + j], sd = w[sO + j];
+    for (uint t = 0u; t < nrows; t++) {
+        uint k = fO + t * 80u + j;
+        a[k] = (log(a[k] + 5.9604644775390625e-08) - m) / sd;
+    }
+    if (zero_row == 1u) a[fO + nrows * 80u + j] = 0.0;
+}

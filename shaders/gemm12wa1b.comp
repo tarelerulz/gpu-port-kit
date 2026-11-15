@@ -1,0 +1,162 @@
+#version 450
+// out[m][n] = epi(bias[n] + sum_k A[m][k] * W[k][n]); 12 n x 4 m per thread. A strided (arena or weights),
+// W = weights [K][NP] (NP multiple of 12, vec4-aligned), out strided.
+// OV4: 0 scalar stores, 1 vec4 along m, 2 vec4 along n.
+// u: 0 M 1 N 2 K 3 NP | 4 A, 5 sAm, 6 sAk | 7 W | 8 bias (0xffffffff = none) | 9 out, 10 sOm, 11 sOn | 12 epi
+// -DWA=1: W is in the arena, [K] rows of pitch u[21] floats (no bias: u[8] = 0xffffffff)
+// -DRS=1 (with OV4=1, no POST): out[n][m] += scale * result, scale = float bits in u[13]
+// -DPOST (gemm12p_*): 13 R = residual with the out strides, added after epi (folds an Add job in, 2026-10-14)
+//   OV4 1 only: 14 mode (0 none, 1 v + R) | 16 out2 (0xffffffff = none,
+//   out strides) = v * S[n] + T[n] (a BatchNorm of the result, also kept) | 17 S, 18 T, 19 sSn, 20 sTn
+layout(local_size_x = 256) in;
+#include "common.glsl"   // compile with -I shaders
+#include "specialization.glsl"
+#if W16 || W8
+// Packed weights (2026-11-12): fewer memory reads per step. W16: two half-floats per word, [K][NP/2 words].
+// W8: four signed bytes per word, [K][NP/4 words], true weight = byte * scale[n] (scale [NP] floats at u[14]).
+layout(std430, binding = 1) readonly buffer WU { uint wu[]; };
+#endif
+#define LDA(base, idx) a[int(base) + (idx)]
+#define ACC(j, wv, c) s##j += wv.c * x;
+void main() {
+    #if BATCH
+    // batched (2026-11-12): workgroup y = batch index; A and out move by u[22] / u[23] floats per batch
+    uint M = U(0), N = U(1), K = U(2), NP = U(3), q4 = (M + 3u) / 4u, i = gl_GlobalInvocationID.x;
+#else
+    uint M = U(0), N = U(1), K = U(2), NP = U(3), q4 = (M + 3u) / 4u, i = tid();
+#endif
+#if UNI
+    // No early return (2026-11-12): a return here puts the whole K loop under a per-lane mask on v3d (every register
+    // write becomes a conditional move and values spill to memory: 364 instructions per step). Spare threads redo the
+    // last tile instead and only the stores are skipped.
+    bool live = i < (NP / 12u) * q4;
+    i = min(i, (NP / 12u) * q4 - 1u);
+#else
+    if (i >= (NP / 12u) * q4) return;
+#endif
+    uint cg = i / q4, q = i % q4, m0 = q * 4u;
+    int sAm = int(U(5)), sAk = int(U(6));
+#if BATCH
+    uint Ab = U(4) + gl_WorkGroupID.y * p.u[22];
+#else
+    uint Ab = U(4);
+#endif
+    int a0 = int(min(m0, M - 1u)) * sAm, a1 = int(min(m0 + 1u, M - 1u)) * sAm;
+    int a2 = int(min(m0 + 2u, M - 1u)) * sAm, a3 = int(min(m0 + 3u, M - 1u)) * sAm;
+    vec4 b0 = vec4(0.0), b1 = vec4(0.0), b2 = vec4(0.0);
+    if (U(8) != 0xffffffffu) { uint bo = U(8) / 4u + cg * 3u; b0 = w4[bo]; b1 = w4[bo + 1u]; b2 = w4[bo + 2u]; }
+#if W8
+    vec4 s0 = vec4(0.0), s1 = vec4(0.0), s2 = vec4(0.0), s3 = vec4(0.0), s4 = vec4(0.0), s5 = vec4(0.0);
+    vec4 s6 = vec4(0.0), s7 = vec4(0.0), s8 = vec4(0.0), s9 = vec4(0.0), s10 = vec4(0.0), s11 = vec4(0.0);
+#else
+    vec4 s0 = vec4(b0.x), s1 = vec4(b0.y), s2 = vec4(b0.z), s3 = vec4(b0.w);
+    vec4 s4 = vec4(b1.x), s5 = vec4(b1.y), s6 = vec4(b1.z), s7 = vec4(b1.w);
+    vec4 s8 = vec4(b2.x), s9 = vec4(b2.y), s10 = vec4(b2.z), s11 = vec4(b2.w);
+#endif
+#if WA
+    // W read from the arena (activations as the right-hand matrix), row pitch u[21] floats (2026-11-12, attention)
+#if BATCH
+    uint wb = (p.u[7] + gl_WorkGroupID.y * p.u[24]) / 4u + cg * 3u, ws = p.u[21] / 4u;   // u[24]: W offset per batch
+#else
+    uint wb = p.u[7] / 4u + cg * 3u, ws = p.u[21] / 4u;
+#endif
+#define WLD(i) a4[i]
+#elif WP
+    // W in the weights with its own row pitch u[21] (a wider table read through a window, 2026-11-12)
+#if BATCH
+    uint wb = (p.u[7] + gl_WorkGroupID.y * p.u[24]) / 4u + cg * 3u, ws = p.u[21] / 4u;   // u[24]: W offset per batch
+#else
+    uint wb = p.u[7] / 4u + cg * 3u, ws = p.u[21] / 4u;
+#endif
+#define WLD(i) w4[i]
+#else
+    uint wb = p.u[7] / 4u + cg * 3u, ws = NP / 4u;
+#define WLD(i) w4[i]
+#endif
+    uint ab4 = Ab / 4u + q, as4 = uint(sAk) / 4u;   // UA: k-major input, Ab and sAk multiples of 4
+    for (uint k = 0u; k < K; k++) {
+        int kk = int(k) * sAk;
+#if UA
+        vec4 x = a4[ab4 + k * as4];                       // unsigned addressing (2026-11-12): no signed divide per step
+#elif AV4
+        vec4 x = a4[(int(Ab) + kk) / 4 + int(q)];        // m contiguous, 4-aligned rows (padded pitch)
+#else
+        vec4 x = vec4(LDA(Ab, a0 + kk), LDA(Ab, a1 + kk), LDA(Ab, a2 + kk), LDA(Ab, a3 + kk));
+#endif
+#if W16
+        uint wi = p.u[7] + cg * 6u + k * (NP / 2u);
+        vec4 w0 = vec4(unpackHalf2x16(wu[wi]), unpackHalf2x16(wu[wi + 1u]));
+        vec4 w1 = vec4(unpackHalf2x16(wu[wi + 2u]), unpackHalf2x16(wu[wi + 3u]));
+        vec4 w2 = vec4(unpackHalf2x16(wu[wi + 4u]), unpackHalf2x16(wu[wi + 5u]));
+#elif W8
+        uint wi = p.u[7] + cg * 3u + k * (NP / 4u);
+        int p0 = int(wu[wi]), p1 = int(wu[wi + 1u]), p2 = int(wu[wi + 2u]);
+        vec4 w0 = vec4(ivec4(p0 << 24, p0 << 16, p0 << 8, p0) >> 24);
+        vec4 w1 = vec4(ivec4(p1 << 24, p1 << 16, p1 << 8, p1) >> 24);
+        vec4 w2 = vec4(ivec4(p2 << 24, p2 << 16, p2 << 8, p2) >> 24);
+#else
+        vec4 w0 = WLD(wb + k * ws), w1 = WLD(wb + k * ws + 1u), w2 = WLD(wb + k * ws + 2u);
+#endif
+        ACC(0, w0, x) ACC(1, w0, y) ACC(2, w0, z) ACC(3, w0, w)
+        ACC(4, w1, x) ACC(5, w1, y) ACC(6, w1, z) ACC(7, w1, w)
+        ACC(8, w2, x) ACC(9, w2, y) ACC(10, w2, z) ACC(11, w2, w)
+    }
+#if W8
+    { uint so = p.u[14] / 4u + cg * 3u; vec4 c0 = w4[so], c1 = w4[so + 1u], c2 = w4[so + 2u];
+      s0 = s0 * c0.x + b0.x; s1 = s1 * c0.y + b0.y; s2 = s2 * c0.z + b0.z; s3 = s3 * c0.w + b0.w;
+      s4 = s4 * c1.x + b1.x; s5 = s5 * c1.y + b1.y; s6 = s6 * c1.z + b1.z; s7 = s7 * c1.w + b1.w;
+      s8 = s8 * c2.x + b2.x; s9 = s9 * c2.y + b2.y; s10 = s10 * c2.z + b2.z; s11 = s11 * c2.w + b2.w; }
+#endif
+#if UNI
+    if (!live) return;
+#endif
+#if BATCH
+    uint ob = p.u[9] + gl_WorkGroupID.y * p.u[23], op = U(12);
+#else
+    uint ob = p.u[9], op = U(12);
+#endif
+    int sOm = int(U(10)), sOn = int(U(11));
+#ifdef POST
+    int dR = int(U(13)) - int(ob);
+#define R4(o) + a4[(o) + dR / 4]
+#define R1(o) + a[(o) + dR]
+#else
+#define R4(o)
+#define R1(o)
+#endif
+#if OV4 == 2
+    // out n-contiguous (channels-last: sOn == 1, sOm and out 4-aligned, N % 4 == 0): 3 vec4 per frame
+#define PUTM(c, mm) if (m0 + mm < M) { int o = (int(ob) + int(m0 + mm) * sOm) / 4 + int(cg) * 3; uint n = cg * 12u; \
+    if (n < N) a4[o] = epi4(vec4(s0.c, s1.c, s2.c, s3.c), op) R4(o); \
+    if (n + 4u < N) a4[o + 1] = epi4(vec4(s4.c, s5.c, s6.c, s7.c), op) R4(o + 1); \
+    if (n + 8u < N) a4[o + 2] = epi4(vec4(s8.c, s9.c, s10.c, s11.c), op) R4(o + 2); }
+    PUTM(x, 0u) PUTM(y, 1u) PUTM(z, 2u) PUTM(w, 3u)
+#else
+#if OV4
+#ifdef POST
+    uint pm = U(14);
+    int d2 = int(p.u[16]) - int(ob);
+    bool o2 = p.u[16] != 0xffffffffu;
+#define PUT(j, J) { uint n = cg * 12u + J; if (n < N) { int o = (int(ob) + int(n) * sOn) / 4 + int(q); \
+    vec4 v = epi4(s##j, op); \
+    if (pm == 1u) v = v + a4[o + dR / 4]; \
+    a4[o] = v; \
+    if (o2) a4[o + d2 / 4] = v * a[int(p.u[17]) + int(n) * int(U(19))] + a[int(p.u[18]) + int(n) * int(U(20))]; } }
+#else
+#if RS
+    // residual folded in (2026-11-12): out += scale * act(result), scale = float bits in u[13]
+    float rsc = uintBitsToFloat(p.u[13]);
+#define PUT(j, J) { uint n = cg * 12u + J; if (n < N) { int o = (int(ob) + int(n) * sOn) / 4 + int(q); a4[o] = a4[o] + rsc * epi4(s##j, op); } }
+#else
+#define PUT(j, J) { uint n = cg * 12u + J; if (n < N) a4[(int(ob) + int(n) * sOn) / 4 + int(q)] = epi4(s##j, op); }
+#endif
+#endif
+#else
+#define PUT(j, J) { uint n = cg * 12u + J; if (n < N) { int o = int(ob) + int(n) * sOn + int(m0) * sOm; \
+    a[o] = epi(s##j.x, op) R1(o); if (m0 + 1u < M) a[o + sOm] = epi(s##j.y, op) R1(o + sOm); \
+    if (m0 + 2u < M) a[o + 2 * sOm] = epi(s##j.z, op) R1(o + 2 * sOm); \
+    if (m0 + 3u < M) a[o + 3 * sOm] = epi(s##j.w, op) R1(o + 3 * sOm); } }
+#endif
+    PUT(0, 0u) PUT(1, 1u) PUT(2, 2u) PUT(3, 3u) PUT(4, 4u) PUT(5, 5u) PUT(6, 6u) PUT(7, 7u) PUT(8, 8u) PUT(9, 9u) PUT(10, 10u) PUT(11, 11u)
+#endif
+}

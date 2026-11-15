@@ -1,0 +1,48 @@
+#version 450
+// LayerNorm on k-major data, 4 frames per invocation (2026-11-12): x[c][t], rows of pitch TP, vec4 = 4 frames.
+// Same formula as ln_km (two passes for mean and variance). Padding frames (t >= T) get whatever their input gives.
+// u: 0 T, 1 d, 2 TP, 3 in, 4 out, 5 gamma (weights), 6 beta (weights)
+#ifndef LS
+#define LS 256
+#endif
+layout(local_size_x = LS) in;
+layout(std430, binding = 0) buffer A4 { vec4 a4[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint q = gl_GlobalInvocationID.x;
+    uint T = p.u[0], d = p.u[1], ts = p.u[2] / 4u, i4 = p.u[3] / 4u + q, o4 = p.u[4] / 4u + q, gO = p.u[5], bO = p.u[6];
+    if (q * 4u >= T) return;
+    // one pass for the statistics (sum and sum of squares of the channel-centred values: the first channel is subtracted so
+    // E[x^2] - m^2 does not lose precision when the mean is large), 8 channels per step so 8 independent loads are in flight
+    uint d8 = d & ~7u;
+    vec4 c0 = a4[i4];                                   // reference value per frame (channel 0)
+    vec4 s0 = vec4(0.0), s1 = vec4(0.0), q0 = vec4(0.0), q1 = vec4(0.0);
+    uint c = 0u;
+    for (; c < d8; c += 8u) {
+        vec4 x0 = a4[i4 + c * ts] - c0, x1 = a4[i4 + (c + 1u) * ts] - c0, x2 = a4[i4 + (c + 2u) * ts] - c0, x3 = a4[i4 + (c + 3u) * ts] - c0;
+        vec4 x4 = a4[i4 + (c + 4u) * ts] - c0, x5 = a4[i4 + (c + 5u) * ts] - c0, x6 = a4[i4 + (c + 6u) * ts] - c0, x7 = a4[i4 + (c + 7u) * ts] - c0;
+        s0 += (x0 + x1) + (x2 + x3); s1 += (x4 + x5) + (x6 + x7);
+        q0 += (x0 * x0 + x1 * x1) + (x2 * x2 + x3 * x3); q1 += (x4 * x4 + x5 * x5) + (x6 * x6 + x7 * x7);
+    }
+    vec4 sm = s0 + s1, sq = q0 + q1;
+    for (; c < d; c++) { vec4 x = a4[i4 + c * ts] - c0; sm += x; sq += x * x; }
+    vec4 dm = sm / float(d);
+    vec4 mean = c0 + dm;
+    vec4 var = max(sq / float(d) - dm * dm, vec4(0.0));
+    vec4 inv = 1.0 / sqrt(var + 1e-5);
+    for (c = 0u; c < d8; c += 8u) {
+        vec4 x0 = a4[i4 + c * ts], x1 = a4[i4 + (c + 1u) * ts], x2 = a4[i4 + (c + 2u) * ts], x3 = a4[i4 + (c + 3u) * ts];
+        vec4 x4 = a4[i4 + (c + 4u) * ts], x5 = a4[i4 + (c + 5u) * ts], x6 = a4[i4 + (c + 6u) * ts], x7 = a4[i4 + (c + 7u) * ts];
+        a4[o4 + c * ts] = (x0 - mean) * inv * w[gO + c] + w[bO + c];
+        a4[o4 + (c + 1u) * ts] = (x1 - mean) * inv * w[gO + c + 1u] + w[bO + c + 1u];
+        a4[o4 + (c + 2u) * ts] = (x2 - mean) * inv * w[gO + c + 2u] + w[bO + c + 2u];
+        a4[o4 + (c + 3u) * ts] = (x3 - mean) * inv * w[gO + c + 3u] + w[bO + c + 3u];
+        a4[o4 + (c + 4u) * ts] = (x4 - mean) * inv * w[gO + c + 4u] + w[bO + c + 4u];
+        a4[o4 + (c + 5u) * ts] = (x5 - mean) * inv * w[gO + c + 5u] + w[bO + c + 5u];
+        a4[o4 + (c + 6u) * ts] = (x6 - mean) * inv * w[gO + c + 6u] + w[bO + c + 6u];
+        a4[o4 + (c + 7u) * ts] = (x7 - mean) * inv * w[gO + c + 7u] + w[bO + c + 7u];
+    }
+    for (; c < d; c++)
+        a4[o4 + c * ts] = (a4[i4 + c * ts] - mean) * inv * w[gO + c] + w[bO + c];
+}

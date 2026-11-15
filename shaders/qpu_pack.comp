@@ -1,0 +1,22 @@
+#version 450
+// Packs a dynamic matmul weight (an activation) into the QPU kernel's weight stream format (2026-11-12): per tile of 16 outputs,
+// 16 zero bias words, then K rows of 8 words, each word two f16 weights (low half = even n). src[k * pitch + n] (n contiguous),
+// rows k >= Kvalid and columns n >= N are zero. One workgroup row (y) per head.
+// u: 0 Kvalid, 1 N, 2 src, 3 pitch, 4 dst, 5 ntiles, 6 tile_words, 7 src head stride, 8 dst head stride
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint id = gl_GlobalInvocationID.x, head = gl_WorkGroupID.y;
+    uint Kv = p.u[0], N = p.u[1], src = p.u[2] + head * p.u[7], pitch = p.u[3], tw = p.u[6];
+    if (id >= p.u[5] * tw) return;
+    uint tile = id / tw, r = id % tw, dst = p.u[4] + head * p.u[8] + id;
+    if (r < 16u) { a[dst] = 0.0; return; }
+    uint r2 = r - 16u, k = r2 >> 3u, pr = r2 & 7u, n0 = tile * 16u + 2u * pr;
+    float lo = 0.0, hi = 0.0;
+    if (k < Kv) {
+        if (n0 < N) lo = a[src + k * pitch + n0];
+        if (n0 + 1u < N) hi = a[src + k * pitch + n0 + 1u];
+    }
+    a[dst] = uintBitsToFloat(packHalf2x16(vec2(lo, hi)));
+}

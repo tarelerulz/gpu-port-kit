@@ -1,0 +1,85 @@
+#version 450
+// Matmul, k-major in and out, written for how v3d compiles (2026-11-12):
+//  - no early return: a return before the K loop puts the loop under a per-lane mask (conditional moves everywhere);
+//  - the tile is TW vec4 of outputs x 4 rows (TW = 2: 32 sums), small enough that the sums stay in registers.
+//    gemm12 (48 sums) keeps every sum in memory: its K loop is 330-360 instructions for 48 multiply-adds.
+// out[n][m] = act(bias[n] + sum_k A[k][m] * W[k][n]). A k-major [K][pitch sAk], m contiguous. W [K][NP] floats.
+// Spare threads redo the last tile and skip the stores, so dispatch only the groups needed.
+// u: 0 M 1 N 2 K 3 NP | 4 A 6 sAk | 7 W 8 bias (0xffffffff = none) | 9 out 11 sOn (pitch of out rows) | 12 epi
+// -DRS=1: out += scale * act(result), scale = float bits in u[13]
+// -DWA=1: W from the arena, row pitch u[21]. -DWP=1: W from the weights, row pitch u[21].
+// -DOROW=1: output row-major [m][n] (out + m * u[10] + n), needs N % 4 == 0 and TW vec4 stores along n.
+layout(local_size_x = 64) in;
+#include "common.glsl"
+#ifndef TW
+#define TW 2
+#endif
+#if WA
+#define WLD(i) a4[i]
+#else
+#define WLD(i) w4[i]
+#endif
+void main() {
+    uint M = p.u[0], N = p.u[1], K = p.u[2], NP = p.u[3], q4 = (M + 3u) / 4u;
+    uint ncg = (NP / 4u + uint(TW) - 1u) / uint(TW);
+    uint total = ncg * q4, i = gl_GlobalInvocationID.x;
+    bool live = i < total;
+    i = min(i, total - 1u);
+    uint cg = i / q4, q = i % q4;
+    uint ab = p.u[4] / 4u + q, as = p.u[6] / 4u;
+    uint wb = p.u[7] / 4u + cg * uint(TW);
+#if WA || WP
+    uint ws = p.u[21] / 4u;
+#else
+    uint ws = NP / 4u;
+#endif
+    vec4 s0 = vec4(0.0), s1 = vec4(0.0), s2 = vec4(0.0), s3 = vec4(0.0);
+#if TW >= 2
+    vec4 s4 = vec4(0.0), s5 = vec4(0.0), s6 = vec4(0.0), s7 = vec4(0.0);
+#endif
+#if TW >= 3
+    vec4 s8 = vec4(0.0), s9 = vec4(0.0), s10 = vec4(0.0), s11 = vec4(0.0);
+#endif
+    for (uint k = 0u; k < K; k++) {
+        vec4 x = a4[ab + k * as];
+        vec4 w0 = WLD(wb + k * ws);
+        s0 += w0.x * x; s1 += w0.y * x; s2 += w0.z * x; s3 += w0.w * x;
+#if TW >= 2
+        vec4 w1 = WLD(wb + k * ws + 1u);
+        s4 += w1.x * x; s5 += w1.y * x; s6 += w1.z * x; s7 += w1.w * x;
+#endif
+#if TW >= 3
+        vec4 w2 = WLD(wb + k * ws + 2u);
+        s8 += w2.x * x; s9 += w2.y * x; s10 += w2.z * x; s11 += w2.w * x;
+#endif
+    }
+    if (!live) return;
+    uint op = p.u[12], n0 = cg * uint(4 * TW);
+    bool hb = p.u[8] != 0xffffffffu;
+    uint bo = p.u[8] / 4u + cg * uint(TW);
+#if RS
+    float rsc = uintBitsToFloat(p.u[13]);
+#define ST(o, v) a4[o] = a4[o] + rsc * (v)
+#else
+#define ST(o, v) a4[o] = (v)
+#endif
+#if OROW
+#define PUTG(g, sa, sb, sc_, sd) if (n0 + uint(4 * g) < N) { vec4 b = hb ? w4[bo + uint(g)] : vec4(0.0); \
+    uint o = p.u[9] / 4u + cg * uint(TW) + uint(g), sm = p.u[10] / 4u, m0 = q * 4u; \
+    ST(o + m0 * sm, epi4(vec4(sa.x, sb.x, sc_.x, sd.x) + b, op)); \
+    if (m0 + 1u < M) ST(o + (m0 + 1u) * sm, epi4(vec4(sa.y, sb.y, sc_.y, sd.y) + b, op)); \
+    if (m0 + 2u < M) ST(o + (m0 + 2u) * sm, epi4(vec4(sa.z, sb.z, sc_.z, sd.z) + b, op)); \
+    if (m0 + 3u < M) ST(o + (m0 + 3u) * sm, epi4(vec4(sa.w, sb.w, sc_.w, sd.w) + b, op)); }
+#else
+#define PUT1(n, s, bv) if ((n) < N) { uint o = (p.u[9] + (n) * p.u[11]) / 4u + q; ST(o, epi4(s + bv, op)); }
+#define PUTG(g, sa, sb, sc_, sd) { vec4 b = hb ? w4[bo + uint(g)] : vec4(0.0); uint n = n0 + uint(4 * g); \
+    PUT1(n, sa, b.x) PUT1(n + 1u, sb, b.y) PUT1(n + 2u, sc_, b.z) PUT1(n + 3u, sd, b.w) }
+#endif
+    PUTG(0, s0, s1, s2, s3)
+#if TW >= 2
+    PUTG(1, s4, s5, s6, s7)
+#endif
+#if TW >= 3
+    PUTG(2, s8, s9, s10, s11)
+#endif
+}

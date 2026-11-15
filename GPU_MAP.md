@@ -212,3 +212,108 @@ is inherent 1.4 GMAC; a real FFT would save about 0.1 s on the DFT part.
 - So the "16 ms floor" in section 13 was the cost of the matrix size, not a per-step fixed cost. Combining steps would not
   save much time. Short phrases are slow because each matrix still costs its full K x N work, whatever the row count.
 
+
+## 18. Memory guard and generic profile (2026-11-12)
+- `check.guard_run` fills every gap, every unused region and the unwritten part of each input with a guard value, runs the
+  plan, and reads the whole arena back. It reports writes outside the declared regions (by region name and offset) and
+  outputs that were never written. With `poison=True` the guard value is NaN, so any use of memory the plan did not write
+  shows up in the output.
+- Tested (tests/test_memory_guard.py): gemm12 / gemm12o4 / tr_km + gemm12av4(o4) at 6 shapes each (M not a multiple of 4,
+  N not a multiple of 12 or 4, two row blocks, padded stride, odd K), add, silu: no stray writes, outputs complete, values
+  correct in both modes. A deliberate 7-float overrun and a 9-float short write are both reported.
+- Whole nemo8 plan (tests/nemo8_guard.py, clip5s and clip10s): no stray writes in 635 dispatches; logits bit-identical to a
+  clean run in both modes. So the result does not depend on what an earlier request left in the arena. Only FR has unwritten
+  floats (4 pad floats per 516-float row, on purpose).
+- Streaming plans (tests/stream_guard.py, 2026-11-12): front end (gpuport/stream_fe.build) at 1, 21, 64, 76, 252 mel rows,
+  final and not final; live encoder chunk plans (speech-app port stream_gpu.chunk_ops + clear_tail / shift ops, shaders from
+  its gpu/ folder) over 12 chunks (11 x 16 frames + one of 5, history past 128 rows so the shift copies run), state
+  carried in the arena between chunks. No stray writes; X rows and logits bit-identical to a clean run with canary and
+  with NaN in all memory the plans had not written. Positional rows never change. Not in run_all (about 2 minutes).
+- int8 path (tests/nemo8_guard.py <clip> int8, 2026-11-12): the guard FOUND an overrun. The row-scale region QS was sized
+  for T rows, but the positional projection quantizes 2T-1 rows, so T-1 floats were written past QS into the gap (125 on
+  clip5s). The 131072-float gap absorbed it, so the logits were never wrong. Fixed in gpuport/nemo8.py (QS = 2T-1).
+  After the fix: clip5s and clip10s with the k-major int8 kernels, clip5s with the row-major ones (GPUPORT_I8KM=0): no
+  stray writes, logits bit-identical to a clean run with canary and with NaN poison. Texts still match the C reference.
+- run() now deletes its plan / arena_in / arena_out files after a good run (GPUPORT_KEEP=1 keeps them). Their names
+  hold the process id, so every process left files behind: 3.3 GB had piled up in work/ and /home ran full.
+- `gpuport/profile.py` is the generic form of tools/profile_nemo8.py. Its GMAC/s column showed the nemo8 DFT (cos, sin) and
+  mel matmuls still on the row-major kernel at 2.0 GMAC/s (8 + 4 calls, 141 ms). Passing `kscratch` to them
+  (gpuport/nemo8.py): sum of GPU times 2239 -> 2153 ms on clip10s in the same session (front end 650 -> 574 ms),
+  logits still identical to the production encoder (tests/nemo8_rebuild.py). Bench after: clip10s 2.23 s wall, clip5s 0.95 s.
+- Where clip10s time goes now (2153 ms): k-major matmuls 793 ms at 5.9 GMAC/s, att_scores5jf 432, tr_km 192, att_pv6 182,
+  dw4 109, att_softmax 83, fe_im2col_v2 75, ln 71, fe_conv0_v2 70. Attention (scores + softmax + pv) is now 32% and the
+  transposes 9%.
+- Lint now warns about a power-of-two row stride (>= 512) on a row-major matmul (section 10).
+
+## 19. Attention on the matmul kernel (2026-11-12)
+- `ops.attention_km` replaces att_scores5jf + att_softmax + att_pv6 with matmuls on the k-major kernel. New build flag
+  `-DWA=1` in gemm12.comp reads the right-hand matrix from the arena (row pitch in push word 21), so activations can be
+  both sides of a matmul. Scores are kept transposed, ST[h][j][i] with the query index i contiguous.
+  Steps per layer: att_prep (QU, QV, KT in k-major form, bias and scale folded in); position projection written
+  transposed by the matmul itself (gemm12av4o1); per head gemm12wa1 for the content term and for the position term at
+  all 2T-1 offsets; att_comb (relative shift + add); att_softmax_t; per head gemm12wa2 for scores x values.
+- One layer at T=251, d=176, H=4 (tests/test_attention_km.py --time): old 53.3 ms (scores 27.2, softmax 5.2, values
+  11.3, position 9.5 incl. first-use cost) -> new 22.4 ms (8 score matmuls 7.4, shift+add 3.0, softmax 5.1, 4 value
+  matmuls 2.2, position 4.0, prep 0.65). vs numpy: max diff 1e-6 at T = 8, 13, 21, 126, 251; memory guard clean.
+- nemo8 (default on, float32 only; GPUPORT_ATT_KM=0 or build(att_km=False) = old shaders):
+  clip10s sum of GPU times 2153 -> 1755 ms (-18%); bench 2.23 -> 1.85 s wall (CPU path 0.58-0.66 s). clip5s 0.95 -> 0.92 s
+  (attention grows with T squared, so short clips gain little).
+  Logits are NOT bit-identical to the old path (other summation order): max diff 7e-5 (clip10s), 2e-4 (clip5s), argmax
+  100% the same, same tokens. tests/nemo8_rebuild.py checks the old attention bit-exact against production and the
+  default plan against that.
+- Cost: about 6% more arena. Longest clip that fits the 24M-float server arena: 12 s with the matmul attention, 13 s
+  without; build() falls back to the old attention for a clip that only fits without it.
+- Where clip10s goes now (1755 ms): float matmuls 751, tr_km 188, score matmuls 117, dw4 109, softmax 82, im2col 75,
+  ln 70, conv0 70, position projection 52 (+ its transposes).
+- Open ideas, NOT tested: the position projection depends only on the layer and T, not on the audio, so it could be
+  computed once per T and kept in the resident arena (about 100 ms of the 1755); producers writing k-major to drop
+  tr_km (188 ms); dw4 and ln have not been looked at.
+
+## 20. Position tables kept in the weights (2026-11-12)
+- The position projection P = PE Wpos^T + b depends only on the layer, not on the audio. `ops.pos_table_km` computes it on
+  the host for every offset a clip of up to Tmax frames can need (nemo8: POS_TMAX = 304 frames = 12.1 s) and nemo8.prepare
+  appends the 16 tables to the weight blob (+1.72M floats, 6.9 MB; the production blob stays a byte-identical prefix).
+  A clip of T frames reads a window of the table (start rounded down to a vec4, the 0-3 extra rows skipped in att_comb)
+  through gemm12wp1 (flag -DWP=1: weights matrix with its own row pitch). pe_gen, the transposes and the projection
+  matmuls leave the plan (859 -> 762 dispatches on clip10s), and so do the PE and PT regions.
+- One layer at T=251: 23.1 -> 18.4 ms (old shaders 50-53). tests/test_attention_km.py covers both forms at 6 sizes
+  (window offsets 0-3), with the memory guard, max diff 1e-6 vs numpy.
+- nemo8: clip10s sum of GPU times 1770 -> 1696 ms (-4%), clip5s 878 -> 819 ms (-7%). Bench: clip10s 1.79 s wall, clip5s
+  0.89 s (CPU path 0.60 / 0.30 s). Same text; argmax 100% equal to the exact plan, max logit diff 8e-5 / 3e-4.
+- GPUPORT_POS_CACHE=0 = compute per run. Clips longer than 12.1 s use the per-run form, and the old shaders when only
+  those fit the arena (from about 12.8 s).
+- Day total on clip10s (GPU time, same session): 2239 -> 1696 ms (-24%).
+
+## 21. k-major layers and matmul front end (2026-11-12)
+Rule that came out of this round: on this GPU a loop step costs about the same whatever it does (120-150 M steps/s), so
+(a) keep data k-major ([channel][frame], frames contiguous) so neighbouring threads read neighbouring memory,
+(b) do 4 frames per step with vec4, (c) turn anything that is a sum of products into the 12x4 matmul kernel,
+(d) avoid passes that only move data. Each step below was measured on clip10s (sum of GPU times), same session.
+
+| step | ms | what |
+|---|---|---|
+| start (section 20) | 1696 | |
+| layers k-major (GPUPORT_KM) | 1564 | X, HB, H2, ATT, GL, CV kept as [c][t]; matmuls read and write k-major (gemm12av4o1), so the 8 transposes per layer go; ln_km, glu_km, dw_km |
+| 4 frames per thread | 1397 | ln_km4 (0.93 -> 0.35 ms), dw_km4 with a zero halo from glu_kmh (6.8 -> 2.1 ms), att_softmax_t4 = shift + add + softmax in one pass (8.2 -> 3.8 ms) |
+| residual in the matmul | 1366 | gemm12av4rs (-DRS=1): out += scale * result; the 64 add dispatches go |
+| front end as matmuls (fe2) | 1188 | see below |
+
+Front end (fe2, GPUPORT_FE2): conv0 and conv2 are 3x3 stride-2 convs. Old: conv0 shader (70 ms) -> im2col (75) -> transposes
+(60) -> conv2 matmul -> flatten (18) -> transpose -> subsampling matmul. New: fe_phase regroups the mel rows by row mod 4
+(Z[col][c][t3], 2.7 ms); conv0 = 120 small matmuls (K=24, one per column and row parity) that write the planes
+PL[col][dt][ch][t3] conv2 reads directly; fe_c0fix writes the zero padding; conv2 = 20 matmuls (one per output column, K=1584,
+permuted weight copy in the blob) that write straight into the k-major input of the subsampling matmul. No patches, no
+flatten, no transposes. Front end 571 -> 384 ms. Arena for 10 s: 20.9M -> 13.8M floats, so clips up to 19 s fit (was 12-13 s).
+Under 48 frames (1.9 s) the 20 conv2 matmuls cost more than they save (each is latency-bound by K=1584), so short clips
+keep the im2col front end (FE2_MIN_T in nemo8.py; measured crossover 1.8 s).
+
+Result (tools/nemo8_bench.py 3): clip10s 1.25 s wall (GPU 1225 ms), clip5s 0.64 s (614 ms). CPU path 0.58 / 0.28 s.
+Day total clip10s GPU time: 2239 -> 1188 ms (-47%); clip5s about 985 -> 614.
+Correctness: tests/nemo8_lengths.py compares the default plan with the exact plan (old shaders, bit-identical to production)
+at 15 lengths from 0.1 s to 12.8 s (every frame count mod 4, odd and even conv sizes, split row blocks above 251 frames):
+same tokens, argmax equal in every frame, max logit diff 1e-5 to 7e-4. Memory guard clean (default, FE2=0, KM=0, int8).
+Switches: GPUPORT_FE2=0, GPUPORT_KM=0, GPUPORT_POS_CACHE=0, GPUPORT_ATT_KM=0 (each falls back one step).
+
+Where clip10s goes now (1188 ms): matmuls 1005 ms (85%: layers 590, conv2 234, scores 153, DFT/mel/head 60+), softmax 60,
+dw 34, ln 30, the rest under 15 each. The matmul kernel runs at 5.9 GMAC/s; that is now the limit.
+Not tested: a faster matmul kernel; int8 layers with these layouts; the same changes in the streaming engine.

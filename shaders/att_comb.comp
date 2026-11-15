@@ -1,0 +1,15 @@
+#version 450
+// Relative shift and add (2026-11-12): ST[h][j][i] += GT[h][T-1-i+j][i]   (both [row][i], pitch TP, i contiguous)
+// ST holds the content term qu.k, GT the position term qv.P[r] for every r in [0, 2T-1).
+// u: 0 T, 1 H, 2 TP, 3 ST, 4 GT, 5 e (first row of GT is offset -e: read row T-1-i+j+e), 6 rows of GT per head (0 = 2T-1)
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(push_constant) uniform P { uint u[32]; } p;
+void main() {
+    uint T = p.u[0], H = p.u[1], TP = p.u[2], idx = gl_GlobalInvocationID.x;
+    if (idx >= H * T * TP) return;
+    uint i = idx % TP, rem = idx / TP, j = rem % T, h = rem / T;
+    if (i >= T) return;
+    uint GR = p.u[6] == 0u ? 2u * T - 1u : p.u[6];
+    a[p.u[3] + idx] += a[p.u[4] + (h * GR + (T - 1u - i + j) + p.u[5]) * TP + i];
+}
