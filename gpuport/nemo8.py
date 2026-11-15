@@ -14,8 +14,8 @@ from .config import WORK_DIR, merged_shader_dir
 from .server import ExecServer
 from .int8 import read_q8, pack_linear, quant_op, lin_i8, quant_op_km, lin_i8_km
 
-SPEECH_APP = os.path.expanduser('~/speech-app/port')
-MODEL = os.path.expanduser('~/speech-app/models/nemo8.tnm')
+SPEECH_APP = os.environ.get('GPUPORT_SPEECH_APP', os.path.expanduser('~/speech-app/port'))
+MODEL = os.environ.get('GPUPORT_MODEL', os.path.expanduser('~/speech-app/models/nemo8.tnm'))
 PROD_W = os.path.join(SPEECH_APP, 'cache2', 'weights.bin')
 SHADERS = merged_shader_dir()
 ARENA_FLOATS = 24 << 20          # exec_server2 arena (about 10 s of audio fits)

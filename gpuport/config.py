@@ -8,14 +8,18 @@ EXEC_BIN = os.environ.get('GPUPORT_EXEC', os.path.join(os.path.dirname(os.path.d
 # Scratch files (arena/plan/out). Not in /tmp on purpose.
 WORK_DIR = os.environ.get('GPUPORT_WORK', os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'work'))
 # PiOS Vulkan loader + v3dv driver (same as ~/opt/pios-vulkan/env.sh).
-VK_ENV = {
-    'LD_LIBRARY_PATH': os.path.expanduser('~/opt/pios-vulkan/lib'),
-    'VK_ICD_FILENAMES': os.path.expanduser('~/opt/mesa-v3dv/icd.json'),   # patched Mesa (fence-error fix)
-}
+VK_ENV = {}
+_ld = os.environ.get('GPUPORT_LD_LIBRARY_PATH', os.path.expanduser('~/opt/pios-vulkan/lib'))
+_icd = os.environ.get('GPUPORT_VK_ICD', os.path.expanduser('~/opt/mesa-v3dv/icd.json'))   # patched Mesa (fence-error fix)
+# Only set them when the folders exist; otherwise the system Vulkan loader and driver are used.
+if os.path.isdir(_ld):
+    VK_ENV['LD_LIBRARY_PATH'] = _ld
+if os.path.isfile(_icd):
+    VK_ENV['VK_ICD_FILENAMES'] = _icd
 # exec.c fixed buffer sizes (floats). Plans must stay inside them.
 EXEC_ARENA_FLOATS = 8 << 20
 EXEC_WEIGHT_FLOATS = 32 << 20
-# Rules measured on this Pi (see <notes>/2026-11-03-gpu-porting-rules.md).
+# Rules measured on this Pi (see GPU_MAP.md).
 REGION_GAP = 131072       # floats after every arena region
 ALIGN = 64                # floats, arena region start
 MIN_WORKGROUPS = 24       # fewer gave wrong gemm12 output at some shapes
