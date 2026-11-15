@@ -13,7 +13,7 @@ sys.path.insert(0, KIT)
 from gpuport import check
 from gpuport.run import run
 from gpuport.config import WORK_DIR
-from gpuport.nemo8 import load_nemo_ref, prepare, build, SPEECH_APP, SHADERS, ARENA_FLOATS
+from gpuport.nemo8 import load_nemo_ref, prepare, build, test_clip, SHADERS, ARENA_FLOATS
 
 args = sys.argv[1:]
 int8 = 'int8' in args
@@ -22,7 +22,7 @@ clip = args[0] if args else 'clip5s'
 EXEC_BIG = os.path.join(KIT, 'tools', 'exec_big')
 nr = load_nemo_ref(); w, L = prepare(nr, int8=int8)
 wpath = w.save(os.path.join(WORK_DIR, 'nemo8_int8' if int8 else 'nemo8_kit'))
-pcm = np.fromfile(os.path.join(SPEECH_APP, clip + '.pcm'), '<i2').astype(np.float32) / 32768.0
+pcm = test_clip(clip).astype(np.float32) / 32768.0
 plan, ar, R, T = build(len(pcm), L)
 V1 = L['V'] + 1
 kw = dict(weights=wpath, shader_dir=SHADERS, exec_bin=EXEC_BIG, arena_floats=ARENA_FLOATS)

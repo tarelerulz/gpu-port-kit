@@ -17,6 +17,19 @@ from .int8 import read_q8, pack_linear, quant_op, lin_i8, quant_op_km, lin_i8_km
 SPEECH_APP = os.environ.get('GPUPORT_SPEECH_APP', os.path.expanduser('~/speech-app/port'))
 MODEL = os.environ.get('GPUPORT_MODEL', os.path.expanduser('~/speech-app/models/nemo8.tnm'))
 PROD_W = os.path.join(SPEECH_APP, 'cache2', 'weights.bin')
+KIT_ROOT_ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def test_clip(name):
+    """int16 PCM (16 kHz) test clip 'clip5s' or 'clip10s': the author's <SPEECH_APP>/<name>.pcm if it exists,
+    else the first 5 or 10 s of the public sample tests/data/jfk.pcm."""
+    import numpy as np
+    p = os.path.join(SPEECH_APP, name + '.pcm')
+    if os.path.exists(p):
+        return np.fromfile(p, '<i2')
+    secs = 5 if name == 'clip5s' else 10
+    return np.fromfile(os.path.join(KIT_ROOT_, 'tests', 'data', 'jfk.pcm'), '<i2')[:secs * 16000]
+
 SHADERS = merged_shader_dir()
 ARENA_FLOATS = 24 << 20          # exec_server2 arena (about 10 s of audio fits)
 

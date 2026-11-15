@@ -7,14 +7,14 @@ import sys
 import numpy as np
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, KIT)
-from gpuport.nemo8 import load_nemo_ref, prepare, build, collapse, SPEECH_APP, SHADERS
+from gpuport.nemo8 import load_nemo_ref, prepare, build, collapse, test_clip, SHADERS
 from gpuport.server import ExecServer
 from gpuport.config import WORK_DIR
 
 nr = load_nemo_ref(); w, L = prepare(nr)
 wpath = w.save(os.path.join(WORK_DIR, 'nemo8_kit'))
 V = L['V']
-base = np.fromfile(os.path.join(SPEECH_APP, 'clip10s.pcm'), '<i2').astype(np.float32) / 32768.0
+base = test_clip('clip10s').astype(np.float32) / 32768.0
 srv = ExecServer(wpath, SHADERS).start()
 ok_all = True
 for n in [1600, 4000, 16000, 16000 + 640, 16000 + 1280, 16000 + 1920, 36800, 80000, 124321, 160000, 163840, 176000, 192000, 195000, 205000]:
