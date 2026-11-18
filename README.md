@@ -27,6 +27,16 @@ The default path (`python3 tools/transcribe.py clip.wav`) needs only Vulkan with
 - **Driver.** The author ran a self-built Mesa 25.3.6 v3dv and a kernel with `patches/kernel/v3d-fence-error.patch`, which makes a failed GPU job report an error instead of passing silently. Neither is required for the default path. Whether the stock Raspberry Pi OS driver and kernel are enough for `GPUPORT_ASM=1` has not been tested.
 - **Not tested here:** a stock Raspberry Pi OS install, and any board other than the author's Pi 400.
 
+## Decoding: greedy or with the language model
+By default the GPU path turns the scores into text greedily (the best token for each frame), without the language model that the CPU build (`tasr_cli --lm`) uses. On unusual words this can spell stray letters: on 39 clearly spoken Apollo sentences the greedy text had 9 garbled words such as "goodw", "asscent" and "missssion", and the language model fixed all 9.
+To use the language model on the GPU path, build the helper from the oido repo and set two variables:
+```
+make -C /path/to/oido/host tasr_lmdecode
+GPUPORT_LM=/path/to/nemo_lm.tlm GPUPORT_LMDECODE=/path/to/oido/host/tasr_lmdecode python3 tools/transcribe.py clip.wav
+```
+The GPU still does the heavy work; `tasr_lmdecode` runs the same beam search (beam 4) over the scores it produced, which costs about 50 ms for an 11 s clip. If it fails, the text falls back to greedy decoding. It is off unless both variables are set.
+Measured on the 39 sentences (clean synthetic speech, one voice, so treat it as a rough guide): CPU build with the language model 8.06% word error rate, GPU greedy 6.57%, GPU with the language model 7.31%. The GPU text with the language model equals the CPU text on 29 of the 39 sentences; the other 10 differ by one word, because the GPU uses 16-bit weights and the CPU 8-bit. The language model does not lower the error rate on this set (it replaces some unusual but correct words with common ones); what it removes is the stray-letter spellings.
+
 ## Oido port scripts (`port/`)
 `port/gpu_encoder2.py` is the original, standalone version of the nemo8 GPU encoder: one file that builds the plan, talks to the resident server and decodes the text, with the first (slower) set of shaders and no QPU kernel. It works with the current runner (fixed 2026-11-14; `python3 port/gpu_encoder2.py clip.pcm`, raw 16 kHz int16; 11 s JFK sample correct in about 5 s of GPU time) but is kept for reference. Use `tools/transcribe.py` for real work: it is 4 to 7 times faster. `port/nemo_ref.py` reads the model file and is used by the kit.
 Settings (environment variables):

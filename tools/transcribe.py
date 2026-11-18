@@ -1,6 +1,7 @@
 """Transcribe one or more clips with nemo8 on the Pi GPU.
 usage: python3 tools/transcribe.py clip.wav [more clips]     (16 kHz mono 16-bit WAV, or raw 16 kHz int16 with a .pcm/.raw extension)
-Set GPUPORT_MODEL to the nemo8 .tnm file. GPUPORT_ASM=1 uses the hand-written QPU matmul (needs tools/exec_hybrid, see README)."""
+Set GPUPORT_MODEL to the nemo8 .tnm file. GPUPORT_ASM=1 uses the hand-written QPU matmul (needs tools/exec_hybrid, see README).
+GPUPORT_LM + GPUPORT_LMDECODE add beam search with the language model (see \"Decoding\" in the README)."""
 import os
 import sys
 import time

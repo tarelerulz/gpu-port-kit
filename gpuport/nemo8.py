@@ -495,6 +495,8 @@ class Nemo8Encoder:
         self.L = None
         self.srv = None
         self.last_ms = None
+        self.lm = None            # optional language-model decoder (gpuport/lmdecode.py); None = greedy
+        self.lm_failed = False
 
     def _layout(self):
         if self.L is not None:
@@ -521,6 +523,8 @@ class Nemo8Encoder:
     def start(self):
         L = self._layout()
         self.srv = ExecServer(self.weights, SHADERS).start()
+        from .lmdecode import from_env
+        self.lm = from_env()                                  # GPUPORT_LM + GPUPORT_LMDECODE: beam search with the language model
         warm = np.zeros(16000, np.float32)                    # warm-up: pipelines and buffers
         plan, ar, R, T = build(len(warm), L)
         self.srv.run(plan, warm, R['LOG'], T * (L['V'] + 1))
@@ -533,8 +537,17 @@ class Nemo8Encoder:
         L = self._layout()
         plan, ar, R, T = build(len(pcm), L)
         out, self.last_ms = self.srv.run(plan, pcm.astype(np.float32) / 32768.0, R['LOG'], T * (L['V'] + 1))
-        return collapse(out.reshape(T, L['V'] + 1), L['tokens'], L['V'])
+        scores = out.reshape(T, L['V'] + 1)
+        if self.lm is not None and not self.lm_failed:
+            try:
+                return self.lm.decode(scores, L['tokens'])
+            except Exception as e:                            # keep working: greedy text instead
+                self.lm_failed = True
+                print('language-model decoder failed, using greedy decoding:', e)
+        return collapse(scores, L['tokens'], L['V'])
 
     def close(self):
+        if self.lm is not None:
+            self.lm.close()
         if self.srv is not None:
             self.srv.stop()
