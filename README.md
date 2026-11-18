@@ -19,6 +19,14 @@ Needs: a Raspberry Pi 4 or 400 (V3D 4.2) running Linux with Vulkan (loader and t
 
 Measured on the author's Pi 400 (GPU at 700 MHz), 11 s JFK sample, same text in both modes: default 1.2 s, `GPUPORT_ASM=1` 0.7 s. The very first run after a start takes several seconds longer while pipelines compile.
 
+## GPU setup: what the author's numbers assume
+The default path (`python3 tools/transcribe.py clip.wav`) needs only Vulkan with the v3dv driver. Everything below is optional, and it is where your results may differ from the published ones.
+
+- **GPU clock.** The published timings were measured with the GPU at 700 MHz (`v3d_freq=700` and `over_voltage=2` in `config.txt`). A stock Pi 4 or 400 runs the GPU slower (check yours with `vcgencmd measure_clock v3d`), so expect longer times. Do not raise the clock unless you want to: `v3d_freq=700` without `over_voltage=2` made the author's Pi fail to boot (black screen). If you try it, use `tryboot` (a one-time test boot) first and keep a way to edit the SD card from another computer. The gain is small, about 40 ms on a 10 s clip going from 650 to 700 MHz.
+- **`GPUPORT_ASM=1` (the hand-written matmul).** The compiled kernels are in the repo (`shaders/qpu/*.qpu`), so you do not need py-videocore6 to use it. You do need the `exec_hybrid` build (step 1 of the quick start) and permission to open the GPU render device (`/dev/dri/renderD128`; on Raspberry Pi OS the default user is in the `render` group). If it fails, run without the flag: the default path gives the same text, only slower. py-videocore6 (with numpy 2.3.x) is only needed to rebuild the kernels or run the checks in `qpu/` (see `qpu/README.md`).
+- **Driver.** The author ran a self-built Mesa 25.3.6 v3dv and a kernel with `patches/kernel/v3d-fence-error.patch`, which makes a failed GPU job report an error instead of passing silently. Neither is required for the default path. Whether the stock Raspberry Pi OS driver and kernel are enough for `GPUPORT_ASM=1` has not been tested.
+- **Not tested here:** a stock Raspberry Pi OS install, and any board other than the author's Pi 400.
+
 ## Decoding: greedy or with the language model
 By default the GPU path turns the scores into text greedily (the best token for each frame), without the language model that the CPU build (`tasr_cli --lm`) uses. On unusual words this can spell stray letters: on 39 clearly spoken Apollo sentences the greedy text had 9 garbled words such as "goodw", "asscent" and "missssion", and the language model fixed all 9.
 To use the language model on the GPU path, build the helper from the oido repo and set two variables:
