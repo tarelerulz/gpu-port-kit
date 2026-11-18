@@ -48,3 +48,13 @@ def merged_shader_dir(extra=(KIT_SHADERS,), base=None):
                 os.remove(dst)
             os.symlink(os.path.abspath(f), dst)
     return out
+
+
+# 2026-11-16: nemo8.build() reads ~580 GPUPORT_* switches per plan through os.environ (about 3 ms of a 10 ms build).
+# While a plan is being built, ENV holds one snapshot of the environment and env_get() reads that; otherwise it reads os.environ live.
+ENV = None
+
+
+def env_get(key, default=None):
+    e = ENV
+    return os.environ.get(key, default) if e is None else e.get(key, default)

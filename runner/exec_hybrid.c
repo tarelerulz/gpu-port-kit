@@ -23,6 +23,26 @@
 #include <errno.h>
 #include <drm.h>
 #include <drm/v3d_drm.h>
+#include <pthread.h>
+/* 2026-11-16: keep one CPU core busy while a request runs. The ondemand governor otherwise leaves the (idle) CPU at its lowest clock, and
+   every GPU job launch (interrupt -> scheduler -> next job, ~400 per clip) runs at that clock. GPUPORT_SPIN=0 = off. Capped at 30 s. */
+static volatile int spin_on = 0; static int spin_enabled = 1; static unsigned spin_gen = 0; static double spin_cap = 30.0;
+static pthread_mutex_t spin_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t spin_cv = PTHREAD_COND_INITIALIZER;
+static void *spinner(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&spin_mu); while (!spin_on) pthread_cond_wait(&spin_cv, &spin_mu); unsigned g = spin_gen; double cap = spin_cap; pthread_mutex_unlock(&spin_mu);
+        struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+        while (spin_on && spin_gen == g) {
+            for (volatile int i = 0; i < 20000; i++) ;
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            if ((t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9 > cap) { pthread_mutex_lock(&spin_mu); if (spin_gen == g) spin_on = 0; pthread_mutex_unlock(&spin_mu); break; }
+        }
+    }
+    return NULL;
+}
+/* on = 1 with a cap in seconds (request: 30, "wake" line: 0.25); every call starts a new generation so an expiring wake cannot stop a request's spin */
+static void spin_set(int on, double cap) { if (!spin_enabled) return; pthread_mutex_lock(&spin_mu); spin_gen++; spin_cap = cap; spin_on = on; pthread_cond_signal(&spin_cv); pthread_mutex_unlock(&spin_mu); }
 static double nowsec(void){struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9;}
 #define CK(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) { fprintf(stderr, "%s failed %d line %d\n", #x, r_, __LINE__); exit(1); } } while (0)
 #define ARENA_FLOATS (24u << 20)
@@ -103,7 +123,7 @@ static void drm_setup(Buf *A, Buf *W, int ncode, char **codepaths) {
     struct drm_v3d_mmap_bo mb = { .handle = hC }; DCK(ioctl(dfd, DRM_IOCTL_V3D_MMAP_BO, &mb));
     uint8_t *m = mmap(NULL, CODE_BO, PROT_READ | PROT_WRITE, MAP_SHARED, dfd, mb.offset); if (m == MAP_FAILED) { perror("mmap"); exit(1); }
     size_t n = 0;
-    for (int ci = 0; ci < ncode && ci < 11; ci++) {
+    for (int ci = 0; ci < ncode && ci < 14; ci++) {
         FILE *f = fopen(codepaths[ci], "rb"); if (!f) { fprintf(stderr, "no qpu code %s\n", codepaths[ci]); exit(1); }
         n += ci < 6 ? fread(m + ci * 32768, 1, 32768, f) : fread(m + 196608 + (ci - 6) * 8192, 1, 8192, f); fclose(f);   /* ci >= 6: 4 x 8 tiling kernels (qpu_mm4.py) */
     }
@@ -160,19 +180,30 @@ int main(int argc, char **argv) {
     PFN_vkGetSemaphoreFdKHR gsf = (PFN_vkGetSemaphoreFdKHR)vkGetDeviceProcAddr(dev, "vkGetSemaphoreFdKHR");
     PFN_vkImportSemaphoreFdKHR isf = (PFN_vkImportSemaphoreFdKHR)vkGetDeviceProcAddr(dev, "vkImportSemaphoreFdKHR");
     VkCommandBuffer cbs[256];
+    { const char *sp = getenv("GPUPORT_SPIN"); if (sp && sp[0] == '0') spin_enabled = 0; }
+    if (spin_enabled) { pthread_t th; if (pthread_create(&th, NULL, spinner, NULL)) spin_enabled = 0; else pthread_detach(th); }
     fprintf(stderr, "ready\n"); fflush(stderr);
     char req[4096], planpath[1024], arenapath[1024], outpath[1024];
     unsigned long out_off, out_n;
     while (fgets(req, sizeof req, stdin)) {
         /* request: <plan> <arena_file> <arena_offset_floats> <out_file> <out_off> <out_n>  (offset form, persistent arena) */
         unsigned long arena_off = 0;
+        if (!strncmp(req, "wake", 4)) { spin_set(1, 0.25); continue; }   /* no reply: the request follows */
         if (sscanf(req, "%1023s %1023s %lu %1023s %lu %lu", planpath, arenapath, &arena_off, outpath, &out_off, &out_n) != 6) { printf("err bad request\n"); fflush(stdout); continue; }
         double t0 = nowsec();
+        spin_set(1, 30.0);
         f = fopen(arenapath, "rb"); size_t na = fread(A.map + arena_off, 4, ARENA_FLOATS - arena_off, f); fclose(f); (void)na;
         /* plan */
         Op *ops = malloc(sizeof(Op) * 4096); int nops = 0; char line[2048];
-        f = fopen(planpath, "r");
-        while (f && fgets(line, sizeof line, f)) {
+        /* 2026-11-16 binary plan (*.bplan, gpuport.plan.Plan.write_bin): "GPB1", op count, then the Op structs as they are (172 bytes each) */
+        size_t pl_ = strlen(planpath); int binplan = pl_ > 6 && !strcmp(planpath + pl_ - 6, ".bplan");
+        f = fopen(planpath, binplan ? "rb" : "r");
+        if (f && binplan) {
+            uint32_t hd[2] = {0, 0};
+            if (fread(hd, 4, 2, f) != 2 || hd[0] != 0x31425047u || hd[1] > 4096 || fread(ops, sizeof(Op), hd[1], f) != hd[1]) { fclose(f); free(ops); spin_set(0, 0.0); printf("err bad binary plan\n"); fflush(stdout); continue; }
+            nops = (int)hd[1]; for (int i = 0; i < nops; i++) ops[i].name[31] = 0;
+        }
+        while (f && !binplan && fgets(line, sizeof line, f)) {
             if (line[0] == '#' || line[0] == '\n') continue;
             Op *o = &ops[nops]; char *tok = strtok(line, " \n");
             strncpy(o->name, tok, 31); o->local = atoi(strtok(NULL, " \n")); o->gx = atoi(strtok(NULL, " \n")); o->gy = atoi(strtok(NULL, " \n"));
@@ -184,7 +215,7 @@ int main(int argc, char **argv) {
         int ncb = 0, i0 = 0, need_wait = 0, nasm = 0; uint32_t h_prev = 0;
         CK(vkResetFences(dev, 1, &fence));
         for (int i = 0; i <= nops; i++) {
-            int is_asm = (i < nops) && (!strcmp(ops[i].name, "qpu_mm") || !strcmp(ops[i].name, "qpu_mmrs") || !strcmp(ops[i].name, "qpu_mmrelu") || !strcmp(ops[i].name, "qpu_mmrm") || !strcmp(ops[i].name, "qpu_mmsk") || !strcmp(ops[i].name, "qpu_mmsilu") || !strcmp(ops[i].name, "qpu_mmh") || !strcmp(ops[i].name, "qpu_mmskh") || !strncmp(ops[i].name, "qpu4_", 5));
+            int is_asm = (i < nops) && (!strcmp(ops[i].name, "qpu_mm") || !strcmp(ops[i].name, "qpu_mmrs") || !strcmp(ops[i].name, "qpu_mmrelu") || !strcmp(ops[i].name, "qpu_mmrm") || !strcmp(ops[i].name, "qpu_mmsk") || !strcmp(ops[i].name, "qpu_mmsilu") || !strcmp(ops[i].name, "qpu_mmh") || !strcmp(ops[i].name, "qpu_mmskh") || !strncmp(ops[i].name, "qpu4_", 5) || !strncmp(ops[i].name, "qpu1_", 5));
             if (i < nops && !is_asm) continue;
             /* ---- Vulkan segment [i0, i) ---- */
             uint32_t h_in = 0; int made_in = 0;
@@ -219,7 +250,10 @@ int main(int argc, char **argv) {
             } else if (is_asm && h_prev) { h_in = h_prev; h_prev = 0; made_in = 1; }   /* two asm jobs in a row: chain on the previous out syncobj */
             if (!is_asm) { if (i == nops && i == i0) { fprintf(stderr, "plan must end with a Vulkan op\n"); exit(1); } break; }
             /* ---- asm job ---- */
-            if (!strncmp(ops[i].name, "qpu4_", 5)) {   /* 4 vectors x 8 columns kernel (qpu_mm4.py): k-major out, static weights in the weights buffer */
+            /* qpu1_* (2026-11-16, qpu_mm1.py): 1 vector x 8 columns, row tails of <= 16 rows; same weight stream, uniforms and thread table as qpu4 with one block */
+            int q1 = !strncmp(ops[i].name, "qpu1_", 5);
+            if (q1 && ops[i].push[8] > 16) { fprintf(stderr, "qpu1: M %u > 16\n", ops[i].push[8]); exit(1); }
+            if (q1 || !strncmp(ops[i].name, "qpu4_", 5)) {   /* 4 vectors x 8 columns kernel (qpu_mm4.py): k-major out, static weights in the weights buffer */
                 uint32_t *pu4 = &ubo[nasm * 128]; uint32_t *q4 = ops[i].push;
                 uint32_t K4 = q4[0], NTL = q4[1], M4 = q4[8], tw = q4[7];
                 uint32_t nblk = (M4 + 63) / 64; if (nblk < 1) nblk = 1; if (nblk > 8) { fprintf(stderr, "qpu4: M %u > 512\n", M4); exit(1); }
@@ -234,7 +268,8 @@ int main(int argc, char **argv) {
                     tb4[t * 8 + 2] = vaA + 4 * (q4[4] + g * 8 * q4[5] + 64 * mb); tb4[t * 8 + 3] = ntl; tb4[t * 8 + 4] = v;
                     tb4[t * 8 + 5] = tb4[t * 8 + 6] = tb4[t * 8 + 7] = 0;
                 }
-                int img4 = !strcmp(ops[i].name, "qpu4_mmrelu") ? 1 : !strcmp(ops[i].name, "qpu4_mmrs") ? 2 : 0;
+                int img4 = !strcmp(ops[i].name + 5, "mmrelu") ? 1 : !strcmp(ops[i].name + 5, "mmrs") ? 2 : 0;
+                if (q1) img4 += 5;                             /* code images 11-13 (slots 5-7 of the 8 KB images) */
                 uint32_t h_out4 = syncobj_new();
                 csd_submit(vaC + 196608 + img4 * 8192, vaC + 262144 + nasm * 512, h_in, h_out4);
                 if (made_in) syncobj_free(h_in);
@@ -314,6 +349,7 @@ int main(int argc, char **argv) {
             h_prev = h_out; nasm++; i0 = i + 1;
         }
         CK(vkWaitForFences(dev, 1, &fence, VK_TRUE, 120ull * 1000000000ull));
+        spin_set(0, 0.0);
         f = fopen(outpath, "wb"); fwrite(A.map + out_off, 4, out_n, f); fclose(f);
         free(ops);
         printf("done %.1f\n", (nowsec() - t0) * 1e3); fflush(stdout);

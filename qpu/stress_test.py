@@ -14,5 +14,5 @@ for i in range(int(sys.argv[1])):
     if first is None: first = out.copy()
     elif not np.array_equal(out, first): bad += 1
 fds = len(os.listdir(f'/proc/{srv.proc.pid}/fd'))
-print(f'{len(ts)} runs: outputs identical to run 1 in {len(ts) - 1 - bad}/{len(ts) - 1}, median {np.median(ts):.0f} ms, max {max(ts):.0f}, server open fds {fds}')
+print(f'{len(ts)} runs: outputs identical to run 1 in {len(ts) - 1 - bad}/{len(ts) - 1}, median {np.median(ts):.0f} ms, min {min(ts):.0f}, max {max(ts):.0f}, server open fds {fds}')
 srv.stop()

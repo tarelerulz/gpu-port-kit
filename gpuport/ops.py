@@ -9,7 +9,7 @@ Verification status:
 """
 import os
 from .plan import Plan, split_groups
-from .config import GEMM12_MAX_ROWS, MIN_WORKGROUPS
+from .config import GEMM12_MAX_ROWS, MIN_WORKGROUPS, env_get as _env
 import numpy as np
 
 
@@ -183,15 +183,15 @@ def attention_km(plan, T, d, H, qkv, pe, mm_pos, pbu, pbv, att, R, pos=True, pos
     q4 = (T + 3) // 4
     NPg = (GR + 11) // 12 * 12
     name, wbase, wpitch = bd or ('gemm12wa1', PT, PTP)
-    skew = bool(qpu and pos_asm is not None and pos_tab is not None and (T <= 256 or len(_row_split(T)) == 2) and os.environ.get('GPUPORT_ASM_SKEW', '1') == '1')
+    skew = bool(qpu and pos_asm is not None and pos_tab is not None and (T <= 256 or len(_row_split(T)) == 2) and _env('GPUPORT_ASM_SKEW', '1') == '1')
     if qpu:        # scores on the QPU kernel: K^T packed to f16 tiles in the arena, one job per head (qpu_pack + qpu_mm, push 10 = 1)
         PK = R['PK']; nts = (T + 15) // 16; tws = 16 + 8 * dh
         plan.add('qpu_pack', 256, (nts * tws + 255) // 256, H, [dh, T, KT, TP, PK, nts, tws, dh * TP, nts * tws])
-        hj = os.environ.get('GPUPORT_ASM_HEADS', '1') != '0' and H > 1      # all heads in one job (2026-11-13): saves ~0.09 ms launch per job
+        hj = _env('GPUPORT_ASM_HEADS', '1') != '0' and H > 1      # all heads in one job (2026-11-13): saves ~0.09 ms launch per job
         # scores / A x V write whole 16-column tiles: the last tile of head h spills into the first rows of head h + 1, which head h + 1 must
         # overwrite LATER. In one job that order only holds when each thread owns every tile of its row block (8 blocks, rm_ > 224).
         for r0, rm_ in _row_split(T):       # queries [r0, r0 + rm_): balanced blocks above 256 / 128 frames
-            if hj and rm_ <= 256 and ((rm_ + 31) // 32 == 8 or os.environ.get('GPUPORT_ASM_HEADS_ALL', '1') != '0'):     # push 17 = 1: runner keeps first + last tile on one thread
+            if hj and rm_ <= 256 and ((rm_ + 31) // 32 == 8 or _env('GPUPORT_ASM_HEADS_ALL', '1') != '0'):     # push 17 = 1: runner keeps first + last tile on one thread
                 plan.add('qpu_mmh', 256, 1, 1, [dh, nts, QU + r0, TP, ST + r0, TP, PK, tws, rm_, 0, 1, 0, 0, H, dh * TP, nts * tws, T * TP, 1])
                 continue
             for h in range(H):
@@ -223,7 +223,7 @@ def attention_km(plan, T, d, H, qkv, pe, mm_pos, pbu, pbv, att, R, pos=True, pos
             push = [T, GR, dh, NPg, QV + hb, 1, TP, wbase + h * dh * wpitch, none, GT + h * GR * TP, 1, TP, 0] + [0] * 8 + [wpitch]
             plan.add(name, 256, _g((NPg // 12) * q4), 1, push)
     if skew:        # position term already shifted by the QPU kernel: add + softmax, no gather
-        plan.add('att_softmax_sk' if os.environ.get('GPUPORT_SM_ONLINE', '1') == '0' else 'att_softmax_so', LOCAL['att_softmax_t4'], _g(H * q4, LOCAL['att_softmax_t4']), 1, [T, H, TP, ST, GT, e, GR])
+        plan.add('att_softmax_sk' if _env('GPUPORT_SM_ONLINE', '1') == '0' else 'att_softmax_so', LOCAL['att_softmax_t4'], _g(H * q4, LOCAL['att_softmax_t4']), 1, [T, H, TP, ST, GT, e, GR])
     elif fused:       # shift + add + softmax in one pass, 4 queries per thread
         plan.add('att_softmax_t4', LOCAL['att_softmax_t4'], _g(H * q4, LOCAL['att_softmax_t4']), 1, [T, H, TP, ST, GT, e, GR])
     else:
@@ -234,7 +234,7 @@ def attention_km(plan, T, d, H, qkv, pe, mm_pos, pbu, pbv, att, R, pos=True, pos
         PK = R['PK']; Kv = T + (T & 1); twv = 16 + 8 * Kv
         plan.add('qpu_pack', 256, (3 * twv + 255) // 256, H, [T, dh, qkv + 2 * d, 3 * d, PK, 3, twv, dh, 3 * twv])
         for r0, rm_ in _row_split(T):
-            if os.environ.get('GPUPORT_ASM_HEADS', '1') != '0' and H > 1 and rm_ <= 256 and ((rm_ + 31) // 32 == 8 or os.environ.get('GPUPORT_ASM_HEADS_ALL', '1') != '0'):
+            if _env('GPUPORT_ASM_HEADS', '1') != '0' and H > 1 and rm_ <= 256 and ((rm_ + 31) // 32 == 8 or _env('GPUPORT_ASM_HEADS_ALL', '1') != '0'):
                 plan.add('qpu_mmh', 256, 1, 1, [Kv, 3, ST + r0, TP, att + r0, att_pitch, PK, twv, rm_, 0, 1, 0, 0, H, T * TP, 3 * twv, dh * att_pitch, 1])
                 continue
             for h in range(H):
@@ -299,7 +299,7 @@ def _row_split(M):
     (5 of 8 threads busy, or a whole extra pass for a few rows). Run rows [0, r0) and [r0, M) as two jobs instead; the tail job spreads over all 8 threads.
     GPUPORT_ASM_SPLIT=0 turns it off (the plan then falls back to the Mesa path for those lengths, see nemo8.use_asm)."""
     import os
-    if os.environ.get('GPUPORT_ASM_SPLIT', '1') != '0':
+    if _env('GPUPORT_ASM_SPLIT', '1') != '0':
         for lo, hi in ((128, 192), (256, 512)):      # 5 or 6 blocks (3 blocks, 65-96 rows: split TESTED worse, 254 -> 269 ms)   # 3, 5 or 6 blocks of 32 rows leave QPUs idle (G = 8 // nblk); 2026-11-13: was (128, 136), (256, 512)
             if lo < M <= hi:
                 return [(0, lo), (lo, M - lo)]
@@ -337,10 +337,12 @@ def _pieces4(M, old):
     blocks costs a whole 64-row block there; the 2 x 16 kernel (32-row block, same weights in its own tile format: old) does it at half the cost.
     GPUPORT_ASM_TAIL=0 = off."""
     import os
-    if old is not None and os.environ.get('GPUPORT_ASM_TAIL', '1') != '0' and os.environ.get('GPUPORT_ASM_SPLIT', '1') != '0':
+    if old is not None and _env('GPUPORT_ASM_TAIL', '1') != '0' and _env('GPUPORT_ASM_SPLIT', '1') != '0':
         for lo in (64, 128, 256):
             if lo < M <= lo + 32:
-                return [(0, lo, False), (lo, M - lo, True)]
+                # 2026-11-16: <= 16 leftover rows on the 1-vector kernel (qpu/qpu_mm1.py, reads the 4 x 8 kernel's weights): 26-37% less than the
+                # 2 x 16 kernel at these shapes (K=1584: 0.73 vs 1.06 ms per job). GPUPORT_ASM_TAIL1=0 = 2 x 16 kernel as before.
+                return [(0, lo, False), (lo, M - lo, 2 if M - lo <= 16 and _env('GPUPORT_ASM_TAIL1', '1') != '0' else True)]
     return [(r0, rm_, False) for r0, rm_ in _row_split(M)]
 
 
@@ -349,7 +351,9 @@ def asm4_mm(plan, a_off, M, a_pitch, asm, out_off, out_pitch, relu=False, old=No
     old: the same matrix in the 2 x 16 kernel's format (nemo8.put_asm) for a short row tail (_pieces4)."""
     assert M <= 512
     for r0, rm_, o_ in _pieces4(M, old):
-        if o_:
+        if o_ == 2:
+            plan.add('qpu1_mmrelu' if relu else 'qpu1_mm', 256, 1, 1, [asm['k'], asm['ntiles'], a_off + r0, a_pitch, out_off + r0, out_pitch, asm['wo'], asm['tile_words'], rm_])
+        elif o_:
             plan.add('qpu_mmrelu' if relu else 'qpu_mm', 256, 1, 1, [old['k'], old['ntiles'], a_off + r0, a_pitch, out_off + r0, out_pitch, old['wo'], old['tile_words'], rm_])
         else:
             plan.add('qpu4_mmrelu' if relu else 'qpu4_mm', 256, 1, 1, [asm['k'], asm['ntiles'], a_off + r0, a_pitch, out_off + r0, out_pitch, asm['wo'], asm['tile_words'], rm_])
@@ -360,7 +364,9 @@ def asm4_mm_rs(plan, a_off, M, a_pitch, asm, out_off, out_pitch, scale, old=None
     """asm4_mm with out += scale * (acc + bias) (residual folded in)."""
     assert M <= 512
     for r0, rm_, o_ in _pieces4(M, old):
-        if o_:
+        if o_ == 2:
+            plan.add('qpu1_mmrs', 256, 1, 1, [asm['k'], asm['ntiles'], a_off + r0, a_pitch, out_off + r0, out_pitch, asm['wo'], asm['tile_words'], rm_, fbits(scale)])
+        elif o_:
             plan.add('qpu_mmrs', 256, 1, 1, [old['k'], old['ntiles'], a_off + r0, a_pitch, out_off + r0, out_pitch, old['wo'], old['tile_words'], rm_, fbits(scale)])
         else:
             plan.add('qpu4_mmrs', 256, 1, 1, [asm['k'], asm['ntiles'], a_off + r0, a_pitch, out_off + r0, out_pitch, asm['wo'], asm['tile_words'], rm_, fbits(scale)])
@@ -390,7 +396,7 @@ def gemm_to_km(plan, a_off, M, mm, out, out_pitch, kscratch, sAm=None, epi=0):
 
 def ln_km(plan, T, d, TP, in_off, out_off, gamma_off, v4=True):
     sc_ = getattr(plan, 'ln_scratch', None)
-    if v4 and sc_ is not None and d % 16 == 0 and os.environ.get('GPUPORT_LN_SPLIT', '0') == '1':      # TESTED slower (10 s: 554 -> 578 ms): off by default
+    if v4 and sc_ is not None and d % 16 == 0 and _env('GPUPORT_LN_SPLIT', '0') == '1':      # TESTED slower (10 s: 554 -> 578 ms): off by default
         # 2026-11-13: ln_km4 walks all d channels serially per thread (~0.2 ms whatever T). Split: statistics over 4 channel chunks,
         # then normalize with one thread per 16 channels. plan.ln_scratch = 9 vec4 per frame quad.
         Tq = (T + 3) // 4

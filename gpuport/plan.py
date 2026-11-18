@@ -25,6 +25,9 @@ _ZTAIL = [' 0' * i + '\n' for i in range(MAX_PUSH + 1)]          # after at leas
 _ZTAIL0 = [' '.join(['0'] * i) + '\n' for i in range(MAX_PUSH + 1)]  # all words zero
 
 
+_BREC = [('name', 'S32'), ('hdr', '<u4', 3), ('push', '<u4', MAX_PUSH)]          # write_bin record = runner/exec_hybrid.c Op
+
+
 class Plan:
     def __init__(self, ops=None):
         self.ops = list(ops or [])
@@ -58,6 +61,19 @@ class Plan:
             out.append('%s %d %d %d ' % (op.shader, op.local, op.gx, op.gy)); out.append(' '.join(map(str, pu[:k]))); out.append(_ZTAIL[len(pu) - k] if k else _ZTAIL0[len(pu)])
         with open(path, 'w') as f:
             f.write(''.join(out))
+        return path
+
+    def write_bin(self, path):
+        """Binary plan for exec_hybrid (2026-11-16): 'GPB1', op count, then one 172-byte record per op (32-byte name, local, gx, gy,
+        32 push words) = the runner's Op struct, so nothing is formatted here or parsed there. Same content as write()."""
+        import numpy as np
+        ops = self.ops
+        rec = np.zeros(len(ops), dtype=_BREC)
+        rec['name'] = [op.shader.encode() for op in ops]
+        rec['hdr'] = [(op.local, op.gx, op.gy) for op in ops]
+        rec['push'] = np.array([op.push for op in ops], dtype=np.int64).astype(np.uint32)      # negative words wrap like strtoul
+        with open(path, 'wb') as f:
+            f.write(b'GPB1' + np.uint32(len(ops)).tobytes() + rec.tobytes())
         return path
 
     @classmethod

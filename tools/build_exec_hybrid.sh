@@ -5,6 +5,6 @@ set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"
 VKL=""; [ -d "$HOME/opt/pios-vulkan/lib" ] && VKL="-L$HOME/opt/pios-vulkan/lib"   # only when the author's Vulkan folder exists; otherwise the system libvulkan
 sed -e 's/uint32_t sd = local;/uint32_t sd = 0xffffffffu;/' "$HERE/../runner/exec_hybrid.c" > "$HERE/exec_hybrid_tmp.c"
-gcc -O2 -I/usr/include/libdrm -o "$HERE/exec_hybrid" "$HERE/exec_hybrid_tmp.c" -lvulkan $VKL
+gcc -O2 -pthread -I/usr/include/libdrm -o "$HERE/exec_hybrid" "$HERE/exec_hybrid_tmp.c" -lvulkan $VKL
 rm -f "$HERE/exec_hybrid_tmp.c"
 echo "built $HERE/exec_hybrid"
