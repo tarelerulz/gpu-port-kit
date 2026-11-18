@@ -1,6 +1,6 @@
 import os, sys
 import numpy as np
-KIT = '/home/tarel/gpu-port-kit'; sys.path.insert(0, KIT)
+KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__))); sys.path.insert(0, KIT)
 os.environ['GPUPORT_ASM'] = '1'; os.environ['GPUPORT_ASM_GATE'] = 'off'
 from gpuport.nemo8 import load_nemo_ref, prepare, build, SPEECH_APP
 from gpuport.server import ExecServer
