@@ -27,6 +27,7 @@ class ExecServer:
     def __init__(self, weights, shader_dir, binary=EXEC_SERVER2, work=WORK_DIR):
         self.weights, self.shader_dir, self.binary, self.work = weights, shader_dir, binary, work
         self.proc = None
+        self.bplan = False
         self.lock = threading.Lock()
         self.seq = 0
         os.makedirs(work, exist_ok=True)
@@ -36,8 +37,12 @@ class ExecServer:
             return self
         env = dict(os.environ, **VK_ENV)
         cmd = [self.binary, self.weights]
+        self.bplan = False
         if os.environ.get('GPUPORT_ASM') == '1':          # hand-written QPU matmul jobs interleaved with the Vulkan plan
-            cmd = [EXEC_HYBRID, self.weights, MM16, MM16RS, MM16RELU, MM16RM, MM16SK, MM16SILU, MM4, MM4RELU, MM4RS, MM16.replace('mm16.qpu', 'mm16h.qpu'), MM16.replace('mm16.qpu', 'mm16skh.qpu')]   # last two: heads variants (2026-11-13)
+            cmd = [EXEC_HYBRID, self.weights, MM16, MM16RS, MM16RELU, MM16RM, MM16SK, MM16SILU, MM4, MM4RELU, MM4RS, MM16.replace('mm16.qpu', 'mm16h.qpu'), MM16.replace('mm16.qpu', 'mm16skh.qpu'),
+                   MM16.replace('mm16.qpu', 'mm1.qpu'), MM16.replace('mm16.qpu', 'mm1relu.qpu'), MM16.replace('mm16.qpu', 'mm1rs.qpu')]   # 1-vector tail kernels (2026-11-16)
+              # last two: heads variants (2026-11-13)
+            self.bplan = os.environ.get('GPUPORT_BPLAN', '1') != '0'      # binary plan file; 0 = text plan
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE, text=True, env=env, cwd=self.shader_dir)
         line = self.proc.stderr.readline()          # 'ready' once pipelines and buffers exist
@@ -63,6 +68,17 @@ class ExecServer:
             self._io = d
         return d
 
+    def wake(self):
+        """exec_hybrid only: start the server's keep-awake thread now (up to 0.25 s), before the request is ready, so the
+        governor has raised the CPU clock by the time the plan is built and the GPU jobs launch. No reply. 2026-11-16."""
+        if self.bplan and os.environ.get('GPUPORT_WAKE', '1') != '0':
+            with self.lock:
+                try:
+                    if self.proc is not None and self.proc.poll() is None:
+                        self.proc.stdin.write('wake\n'); self.proc.stdin.flush()
+                except OSError:
+                    pass
+
     def run(self, plan, arena_init, out_off, out_n):
         """Returns (out float32[out_n], server_ms). Same contract as gpuport.run.run()."""
         if isinstance(plan, (list, tuple)):
@@ -74,10 +90,13 @@ class ExecServer:
             self.start()
             self.seq += 1
             base = os.path.join(self.io_dir(), f'srv_{self.seq % 4}')
-            plan.write(base + '.plan')
+            if self.bplan:                                  # exec_hybrid reads the op records directly (2026-11-16)
+                ppath = plan.write_bin(base + '.bplan')
+            else:
+                ppath = plan.write(base + '.plan')
             arena_init.astype('<f4').tofile(base + '.arena')
             marker = last_reset_marker()
-            self.proc.stdin.write(f'{base}.plan {base}.arena 0 {base}.out {out_off} {out_n}\n')
+            self.proc.stdin.write(f'{ppath} {base}.arena 0 {base}.out {out_off} {out_n}\n')
             self.proc.stdin.flush()
             resp = self.proc.stdout.readline()
             try:

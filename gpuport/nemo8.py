@@ -10,7 +10,8 @@ from .weights import Weights
 from .arena import Arena
 from .plan import Plan
 from . import ops
-from .config import WORK_DIR, merged_shader_dir
+from .config import WORK_DIR, merged_shader_dir, env_get as _env
+from . import config as _config
 from .server import ExecServer
 from .int8 import read_q8, pack_linear, quant_op, lin_i8, quant_op_km, lin_i8_km
 
@@ -232,12 +233,16 @@ def d_ok(L):
 def build(n, L, optimized=True, av4=None, att_km=None):
     """See _build. The matmul attention needs about 6% more arena, so the longest clip that fits drops from 13 s
     to 12 s; a clip that only fits without it is built with the old attention shaders."""
+    _config.ENV = dict(os.environ)           # one environment snapshot for the ~580 switch lookups of a build (2026-11-16)
     try:
-        return _build(n, L, optimized, av4, att_km)
-    except MemoryError:
-        if att_km is False:
-            raise
-        return _build(n, L, optimized, av4, False)
+        try:
+            return _build(n, L, optimized, av4, att_km)
+        except MemoryError:
+            if att_km is False:
+                raise
+            return _build(n, L, optimized, av4, False)
+    finally:
+        _config.ENV = None
 
 
 def _build(n, L, optimized=True, av4=None, att_km=None):
@@ -246,15 +251,15 @@ def _build(n, L, optimized=True, av4=None, att_km=None):
     av4 (2026-11-09): matmuls read activations k-major through a transpose (ops.gemm12 kscratch). Default on for
     optimized plans; GPUPORT_AV4=0 turns it off (old row-major matmuls) for before/after numbers."""
     if av4 is None:
-        av4 = os.environ.get('GPUPORT_AV4', '1') != '0'
+        av4 = _env('GPUPORT_AV4', '1') != '0'
     av4 = bool(av4) and optimized
     # att_km (2026-11-12): attention as matmuls on the k-major kernel (ops.attention_km): 53 -> 22 ms per layer at
     # T=251. Same math, different summation order, so logits differ in the last bits (not bit-identical to the
     # production encoder). Default on with av4, float32 only; GPUPORT_ATT_KM=0 = old attention shaders.
     if att_km is None:
-        att_km = os.environ.get('GPUPORT_ATT_KM', '1') != '0'
+        att_km = _env('GPUPORT_ATT_KM', '1') != '0'
     att_km = bool(att_km) and av4 and not L.get('int8') and d_ok(L)
-    pos_cache = os.environ.get('GPUPORT_POS_CACHE', '1') != '0'     # 2026-11-12: position tables from the weight blob
+    pos_cache = _env('GPUPORT_POS_CACHE', '1') != '0'     # 2026-11-12: position tables from the weight blob
     Tq = (((n // 160 + 1) + 2 - 3) // 2 + 1 + 2 - 3) // 2 + 1
     pos_cache = bool(att_km and pos_cache and L.get('pos_tab') and Tq <= L['pos_tab']['Tmax'])
     d, H, ff, k, sc, V, f2, fe = L['d'], L['H'], L['ff'], L['k'], L['sc'], L['V'], L['f2'], L['fe']
@@ -264,17 +269,17 @@ def _build(n, L, optimized=True, av4=None, att_km=None):
     Tp = (T + 3) // 4 * 4                    # k-major row pitch (frames padded to a vec4)
     # km (2026-11-12): layer activations kept k-major ([c][t]), so no transposes inside the layers; ln, GLU and the
     # depthwise conv have k-major shaders. Needs the matmul attention. GPUPORT_KM=0 = row-major layers.
-    km = att_km and os.environ.get('GPUPORT_KM', '1') != '0'
+    km = att_km and _env('GPUPORT_KM', '1') != '0'
     # fe2 (2026-11-12): conv0 and conv2 as matmuls on regrouped data, no patches, output straight into the k-major
     # input of the subsampling matmul. GPUPORT_FE2=0 = conv0 shader + im2col.
     # Under about 1.8 s (48 frames) the 20 per-column conv2 matmuls cost more than they save, so short clips keep im2col.
-    fe2 = bool(km and L.get('fe2') and os.environ.get('GPUPORT_FE2', '1') != '0' and Tq >= (min(FE2_MIN_T, 16) if os.environ.get('GPUPORT_ASM') == '1' else FE2_MIN_T))   # QPU kernels: matmul front end wins from ~0.6 s (2026-11-13: T=38 190 -> 155 ms, T=7 107 -> 121)
+    fe2 = bool(km and L.get('fe2') and _env('GPUPORT_FE2', '1') != '0' and Tq >= (min(FE2_MIN_T, 16) if _env('GPUPORT_ASM') == '1' else FE2_MIN_T))   # QPU kernels: matmul front end wins from ~0.6 s (2026-11-13: T=38 190 -> 155 ms, T=7 107 -> 121)
     # fe3 (2026-11-12): the DFT as two small matmuls (16 x 32) instead of two dense 512 x 257 ones; GPUPORT_FE3=0 = dense DFT
-    fe3 = bool(fe2 and L.get('fe3') and os.environ.get('GPUPORT_FE3', '1') != '0')
-    use_asm = bool(L.get('asm')) and os.environ.get('GPUPORT_ASM') == '1' and 1 <= T <= 1024 and km and (os.environ.get('GPUPORT_ASM_GATE') == 'off' or os.environ.get('GPUPORT_ASM_SPLIT', '1') != '0' or not (129 <= T <= 136 or 257 <= T <= 328))
-    use_asm4 = bool(use_asm and L.get('asm4') and T <= 512 and os.environ.get('GPUPORT_ASM4', '1') != '0')      # 4 x 8 kernel for K >= 704 matmuls
-    use_head_qpu = bool(use_asm and km and L.get('head_asm') and os.environ.get('GPUPORT_ASM_HEAD', '1') != '0')     # output head on the row-major QPU kernel (N padded to 1040) + repack to pitch V + 1
-    att_qpu = bool(use_asm and att_km and os.environ.get('GPUPORT_ASM_ATT', '1') == '1' and (os.environ.get('GPUPORT_ASM_GATE') == 'off' or (os.environ.get('GPUPORT_ASM_SPLIT', '1') != '0' and not 129 <= T <= 136) or not (129 <= T <= 136 or 257 <= T <= 328)))       # attention scores and A x V on the QPU kernel (packed f16 K / V)
+    fe3 = bool(fe2 and L.get('fe3') and _env('GPUPORT_FE3', '1') != '0')
+    use_asm = bool(L.get('asm')) and _env('GPUPORT_ASM') == '1' and 1 <= T <= 1024 and km and (_env('GPUPORT_ASM_GATE') == 'off' or _env('GPUPORT_ASM_SPLIT', '1') != '0' or not (129 <= T <= 136 or 257 <= T <= 328))
+    use_asm4 = bool(use_asm and L.get('asm4') and T <= 512 and _env('GPUPORT_ASM4', '1') != '0')      # 4 x 8 kernel for K >= 704 matmuls
+    use_head_qpu = bool(use_asm and km and L.get('head_asm') and _env('GPUPORT_ASM_HEAD', '1') != '0')     # output head on the row-major QPU kernel (N padded to 1040) + repack to pitch V + 1
+    att_qpu = bool(use_asm and att_km and _env('GPUPORT_ASM_ATT', '1') == '1' and (_env('GPUPORT_ASM_GATE') == 'off' or (_env('GPUPORT_ASM_SPLIT', '1') != '0' and not 129 <= T <= 136) or not (129 <= T <= 136 or 257 <= T <= 328)))       # attention scores and A x V on the QPU kernel (packed f16 K / V)
     Tk = Tp if km else T                     # frames per row of the layer regions
     FRS = 516 if optimized else 512          # padded frame row stride (512 was 7x slower in the DFT matmul)
     ar = Arena(limit=ARENA_FLOATS)
@@ -297,9 +302,9 @@ def _build(n, L, optimized=True, av4=None, att_km=None):
     if av4:
         # k-major scratch for the transposed matmul input: K <= max(d, ff, 9*sc, 20*sc), 252 rows per block
         R['TK'] = ar.alloc('TK', max(d, ff, 9 * sc, 20 * sc) * 252)
-        if os.environ.get('GPUPORT_LN_SPLIT', '0') == '1':
+        if _env('GPUPORT_LN_SPLIT', '0') == '1':
             R['LNS'] = ar.alloc('LNS', 36 * ((T + 3) // 4) + 64)          # layer norm partial sums (ops.ln_km split, 2026-11-13; off by default)
-        if att_qpu and L.get('pos_bias') and os.environ.get('GPUPORT_ASM_NOPREP', '1') != '0':
+        if att_qpu and L.get('pos_bias') and _env('GPUPORT_ASM_NOPREP', '1') != '0':
             R['QUK'] = ar.alloc('QUK', 2 * d * ((T + 11) // 12 * 12) + 64)   # [QU | KT] written by one matmul (no att_prep, 2026-11-13)
     if fe2:
         for name, size in [('Z', 82 * 8 * Tp), ('PL', 42 * 3 * sc * Tp), ('FLK', 20 * sc * Tp)]:
@@ -335,7 +340,7 @@ def _build(n, L, optimized=True, av4=None, att_km=None):
     if fe2:
         Z, PL, FLK = R['Z'], R['PL'], R['FLK']
         p.dispatch('fe_phase', 256, 82 * 8 * Tp, [Tm, Tp, MEL, Z])
-        if os.environ.get('GPUPORT_BATCH', '1') != '0':      # 40 column positions in one dispatch per plane (2026-11-12)
+        if _env('GPUPORT_BATCH', '1') != '0':      # 40 column positions in one dispatch per plane (2026-11-12)
             for dt2 in range(3):
                 ops.gemm_km_batch(p, Z, T3, Tp, L['fe2']['c0p'][dt2], PL + (3 + dt2) * sc * Tp, Tp, 40, 16 * Tp, 3 * sc * Tp, epi=3)
         else:
@@ -343,18 +348,18 @@ def _build(n, L, optimized=True, av4=None, att_km=None):
             for dt2 in range(3):
                 ops.gemm_km(p, Z + 2 * f0 * 8 * Tp, T3, Tp, L['fe2']['c0p'][dt2], PL + ((f0 + 1) * 3 + dt2) * sc * Tp, Tp, epi=3)
         p.dispatch('fe_c0fix', 64, 42 * 3 * sc, [T3, T2, sc, Tp, PL])
-        if use_asm and os.environ.get('GPUPORT_ASM_CONV', '1') == '1':     # conv2: 20 QPU jobs (one per column position), relu epilogue
+        if use_asm and _env('GPUPORT_ASM_CONV', '1') == '1':     # conv2: 20 QPU jobs (one per column position), relu epilogue
             for f in range(20):
                 if use_asm4:
                     ops.asm4_mm(p, PL + 2 * f * 3 * sc * Tp, T3, Tp, L['asm4'][-1]['c2'], FLK + f * Tp, 20 * Tp, relu=True, old=L['asm'][-1]['c2'])
                 else:
                     ops.asm_mm(p, PL + 2 * f * 3 * sc * Tp, T3, Tp, L['asm'][-1]['c2'], FLK + f * Tp, 20 * Tp, relu=True)
-        elif os.environ.get('GPUPORT_BATCH', '1') != '0':
+        elif _env('GPUPORT_BATCH', '1') != '0':
             ops.gemm_km_batch(p, PL, T3, Tp, L['fe2']['c2p'], FLK, 20 * Tp, 20, 6 * sc * Tp, Tp, epi=3)
         else:
           for f in range(20):
             ops.gemm_km(p, PL + 2 * f * 3 * sc * Tp, T3, Tp, L['fe2']['c2p'], FLK + f * Tp, 20 * Tp, epi=3)
-        if use_asm and os.environ.get('GPUPORT_ASM_CONV', '1') == '1':
+        if use_asm and _env('GPUPORT_ASM_CONV', '1') == '1':
             if use_asm4:
                 ops.asm4_mm(p, FLK, T3, Tp, L['asm4'][-1]['sub'], X, Tp, old=L['asm'][-1]['sub'])
             else:
@@ -366,7 +371,7 @@ def _build(n, L, optimized=True, av4=None, att_km=None):
     if not pos_cache:
         p.dispatch('pe_gen', 64, NP * d, [T, d, PE])
     JB = (T + 3) // 4; IB = (T + 1) // 2
-    i8km = bool(L.get('int8')) and os.environ.get('GPUPORT_I8KM', '1') != '0'   # 2026-11-09: k-major int8 activations
+    i8km = bool(L.get('int8')) and _env('GPUPORT_I8KM', '1') != '0'   # 2026-11-09: k-major int8 activations
     if L.get('int8'):
         # k-major needs (K/4) * Mp words; Mp <= T + 3
         R['Q'] = ar.alloc('Q', (ff // 4) * (T + 4) if i8km else T * (ff // 4)); R['QS'] = ar.alloc('QS', NP)   # one scale per row; the pos projection has NP = 2T-1 rows (was T: overran, found by the guard 2026-11-12)
@@ -382,12 +387,12 @@ def _build(n, L, optimized=True, av4=None, att_km=None):
             ops.gemm12(p_, a_, M_, mm_, out_, epi=epi, kscratch=R.get('TK'))
     def ASMFF(lw_, key_, li_):        # FF first matmul (+ bias): QPU kernel, then silu on the Vulkan side; else the Mesa kernel
         if use_asm:
-            exp_ = os.environ.get('GPUPORT_ASM_EXP')        # timing experiments only: 'none' = no matmul, 'tiny' = one tile
+            exp_ = _env('GPUPORT_ASM_EXP')        # timing experiments only: 'none' = no matmul, 'tiny' = one tile
             a_ = dict(L['asm'][li_][key_])
             if exp_ == 'tiny':
                 a_['ntiles'] = 1
             if exp_ != 'none':
-                if os.environ.get('GPUPORT_ASM_SILU', '1') == '1':
+                if _env('GPUPORT_ASM_SILU', '1') == '1':
                     ops.asm_mm_silu(p, HB, T, Tp, a_, H2, Tp)          # silu fused into the matmul epilogue (GPUPORT_ASM_SILU=0 = separate op)
                     return
                 ops.asm_mm(p, HB, T, Tp, a_, H2, Tp)
@@ -395,17 +400,17 @@ def _build(n, L, optimized=True, av4=None, att_km=None):
         else:
             ops.gemm_km(p, HB, T, Tp, lw_[key_], H2, Tp, epi=2)
     def ASMROW(lw_, key_, li_, out_, ncols_):    # matmul with a row-major [T][ncols] output (qkv)
-        if use_asm and os.environ.get('GPUPORT_ASM_ROW', '1') == '1':
+        if use_asm and _env('GPUPORT_ASM_ROW', '1') == '1':
             ops.asm_mm_rm(p, HB, T, Tp, L['asm'][li_][key_], out_, ncols_)
         else:
             ops.gemm_km(p, HB, T, Tp, lw_[key_], out_)
     def ASMPLAIN(lw_, key_, li_, out_):          # k-major output, bias only (pw1)
-        if use_asm and os.environ.get('GPUPORT_ASM_ROW', '1') == '1':
+        if use_asm and _env('GPUPORT_ASM_ROW', '1') == '1':
             ops.asm_mm(p, HB, T, Tp, L['asm'][li_][key_], out_, Tp)
         else:
             ops.gemm_km(p, HB, T, Tp, lw_[key_], out_, Tp)
     def ASMRS(lw_, key_, li_, src_, scale_):   # matmul with the residual folded in (X += scale * result)
-        if use_asm and os.environ.get('GPUPORT_ASM_RS', '1') == '1':
+        if use_asm and _env('GPUPORT_ASM_RS', '1') == '1':
             if use_asm4 and key_ in ASM4_KEYS:
                 ops.asm4_mm_rs(p, src_, T, Tp, L['asm4'][li_][key_], X, Tp, scale_, old=L['asm'][li_][key_])
             else:
@@ -422,7 +427,7 @@ def _build(n, L, optimized=True, av4=None, att_km=None):
             ASMRS(lw, 'ff1_2', li, H2, 0.5)
             ops.ln_km(p, T, d, Tp, X, HB, lw['n_att'])
             noprep = bool('QUK' in R and att_qpu and L.get('pos_asm') and L.get('pos_bias') and tab is not None and 'quk' in L['asm'][li]
-                          and os.environ.get('GPUPORT_ASM_ROW', '1') == '1' and os.environ.get('GPUPORT_ASM_NOPREP', '1') != '0')
+                          and _env('GPUPORT_ASM_ROW', '1') == '1' and _env('GPUPORT_ASM_NOPREP', '1') != '0')
             if noprep:       # q (+ u, scaled) and k written k-major straight into the attention layout, v row-major where the pack step reads it
                 TPa = (T + 11) // 12 * 12
                 ops.asm_mm(p, HB, T, Tp, L['asm'][li]['quk'], R['QUK'], TPa)
@@ -535,6 +540,7 @@ class Nemo8Encoder:
         if len(pcm) < 1600:                                   # under 0.1 s: nothing to say
             return ''
         L = self._layout()
+        self.srv.wake()                                       # CPU clock up while the plan is built (exec_hybrid only)
         plan, ar, R, T = build(len(pcm), L)
         out, self.last_ms = self.srv.run(plan, pcm.astype(np.float32) / 32768.0, R['LOG'], T * (L['V'] + 1))
         scores = out.reshape(T, L['V'] + 1)
