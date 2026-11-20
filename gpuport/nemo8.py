@@ -502,6 +502,7 @@ class Nemo8Encoder:
         self.last_ms = None
         self.lm = None            # optional language-model decoder (gpuport/lmdecode.py); None = greedy
         self.lm_failed = False
+        self._plan_cache = {}     # (Tm, env_sig) -> (bytearray bplan, R['LOG'], T) (2026-11-20)
 
     def _layout(self):
         if self.L is not None:
@@ -535,16 +536,66 @@ class Nemo8Encoder:
         self.srv.run(plan, warm, R['LOG'], T * (L['V'] + 1))
         return self
 
+    def _cached_bplan(self, n, L):
+        """Return (bplan_bytearray, R['LOG'], T) cached by Tm = n // 160 + 1 and active GPUPORT_* switches.
+        XIN is sized to Tm * 160 - 1 so all arena offsets depend only on Tm; op 0 push[1] is patched with exact n."""
+        import struct
+        from . import plan as _plan
+        Tm = n // 160 + 1
+        sig = tuple(sorted((k, v) for k, v in os.environ.items() if k.startswith('GPUPORT_')))
+        key = (Tm, sig)
+        ent = self._plan_cache.get(key)
+        if ent is None:
+            try:
+                plan, ar, R, T = build(Tm * 160 - 1, L)
+            except MemoryError:
+                return None
+            ops_ = plan.ops
+            if not ops_ or not ops_[0].shader.startswith('fe_frame'):
+                return None
+            rec = np.zeros(len(ops_), dtype=_plan._BREC)
+            rec['name'] = [op.shader.encode() for op in ops_]
+            rec['hdr'] = [(op.local, op.gx, op.gy) for op in ops_]
+            rec['push'] = np.array([op.push for op in ops_], dtype=np.int64).astype(np.uint32)
+            buf = bytearray(b'GPB1' + np.uint32(len(ops_)).tobytes() + rec.tobytes())
+            ent = (buf, R['LOG'], T)
+            if len(self._plan_cache) >= 64:
+                self._plan_cache.pop(next(iter(self._plan_cache)))
+            self._plan_cache[key] = ent
+        buf, rlog, T = ent
+        struct.pack_into('<I', buf, 56, int(n))   # header 8B + name 32B + hdr 12B + push[0] 4B -> op 0 push[1] = n
+        return buf, rlog, T
+
     def transcribe(self, pcm):
         pcm = np.asarray(pcm, np.int16)
         if len(pcm) < 1600:                                   # under 0.1 s: nothing to say
             return ''
         L = self._layout()
         self.srv.wake()                                       # CPU clock up while the plan is built (exec_hybrid only)
+        use_lm = self.lm is not None and not self.lm_failed
+        if self.srv.bplan and os.environ.get('GPUPORT_PLAN_CACHE', '1') != '0':
+            ent = self._cached_bplan(len(pcm), L)
+            if ent is not None:
+                buf, rlog, T = ent
+                x = pcm.astype(np.float32) / 32768.0
+                if not use_lm and os.environ.get('GPUPORT_GPU_ARGMAX', '1') != '0':
+                    ids, self.last_ms = self.srv.run_bplan(buf, x, rlog, T * (L['V'] + 1), greedy_shape=(T, L['V'] + 1))
+                    toks = L['tokens']
+                    s = ''.join(toks[i] for i in ids)
+                    return s[1:] if s.startswith(' ') else s
+                out, self.last_ms = self.srv.run_bplan(buf, x, rlog, T * (L['V'] + 1))
+                scores = out.reshape(T, L['V'] + 1)
+                if use_lm:
+                    try:
+                        return self.lm.decode(scores, L['tokens'])
+                    except Exception as e:
+                        self.lm_failed = True
+                        print('language-model decoder failed, using greedy decoding:', e)
+                return collapse(scores, L['tokens'], L['V'])
         plan, ar, R, T = build(len(pcm), L)
         out, self.last_ms = self.srv.run(plan, pcm.astype(np.float32) / 32768.0, R['LOG'], T * (L['V'] + 1))
         scores = out.reshape(T, L['V'] + 1)
-        if self.lm is not None and not self.lm_failed:
+        if use_lm:
             try:
                 return self.lm.decode(scores, L['tokens'])
             except Exception as e:                            # keep working: greedy text instead

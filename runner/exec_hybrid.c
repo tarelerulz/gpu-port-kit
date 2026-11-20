@@ -24,6 +24,47 @@
 #include <drm.h>
 #include <drm/v3d_drm.h>
 #include <pthread.h>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+/* Fast read from write-combined GPU memory (A.map) using 64-byte NEON burst loads (like heart-nano round 3). */
+static void copy_from_wc(void *dst, const void *src, size_t bytes) {
+#if defined(__aarch64__)
+    uint8_t *d = (uint8_t *)dst;
+    const uint8_t *s = (const uint8_t *)src;
+    size_t i = 0;
+    for (; i + 64 <= bytes; i += 64) {
+        uint8x16_t v0 = vld1q_u8(s + i);
+        uint8x16_t v1 = vld1q_u8(s + i + 16);
+        uint8x16_t v2 = vld1q_u8(s + i + 32);
+        uint8x16_t v3 = vld1q_u8(s + i + 48);
+        vst1q_u8(d + i,      v0);
+        vst1q_u8(d + i + 16, v1);
+        vst1q_u8(d + i + 32, v2);
+        vst1q_u8(d + i + 48, v3);
+    }
+    if (i < bytes) memcpy(d + i, s + i, bytes - i);
+#else
+    memcpy(dst, src, bytes);
+#endif
+}
+static int argmax_f32(const float *row, int n) {
+    int best = 0; float bv = row[0];
+#if defined(__aarch64__)
+    float32x4_t vmax = vdupq_n_f32(-1e38f);
+    int i = 0;
+    for (; i + 16 <= n; i += 16) {
+        float32x4_t m0 = vmaxq_f32(vld1q_f32(row + i), vld1q_f32(row + i + 4));
+        float32x4_t m1 = vmaxq_f32(vld1q_f32(row + i + 8), vld1q_f32(row + i + 12));
+        vmax = vmaxq_f32(vmax, vmaxq_f32(m0, m1));
+    }
+    float hi = vmaxvq_f32(vmax);
+    for (int j = i; j < n; j++) if (row[j] > hi) hi = row[j];
+    for (int j = 0; j < n; j++) if (row[j] == hi) return j;
+#endif
+    for (int j = 1; j < n; j++) if (row[j] > bv) { bv = row[j]; best = j; }
+    return best;
+}
 /* 2026-11-16: keep one CPU core busy while a request runs. The ondemand governor otherwise leaves the (idle) CPU at its lowest clock, and
    every GPU job launch (interrupt -> scheduler -> next job, ~400 per clip) runs at that clock. GPUPORT_SPIN=0 = off. Capped at 30 s. */
 static volatile int spin_on = 0; static int spin_enabled = 1; static unsigned spin_gen = 0; static double spin_cap = 30.0;
@@ -180,27 +221,46 @@ int main(int argc, char **argv) {
     PFN_vkGetSemaphoreFdKHR gsf = (PFN_vkGetSemaphoreFdKHR)vkGetDeviceProcAddr(dev, "vkGetSemaphoreFdKHR");
     PFN_vkImportSemaphoreFdKHR isf = (PFN_vkImportSemaphoreFdKHR)vkGetDeviceProcAddr(dev, "vkImportSemaphoreFdKHR");
     VkCommandBuffer cbs[256];
+    {
+        VkCommandBufferAllocateInfo cba_all = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 256 };
+        CK(vkAllocateCommandBuffers(dev, &cba_all, cbs));
+    }
+    uint32_t so_pool[2] = { syncobj_new(), syncobj_new() };
+    int bp_off = getenv("GPUPORT_BLOCKPASS_OFF") != NULL;
+    int sk_full = getenv("GPUPORT_SK_FULL") != NULL;
+    float *rd_buf = NULL; size_t rd_cap = 0;
+    Op *ops = malloc(sizeof(Op) * 4096);
     { const char *sp = getenv("GPUPORT_SPIN"); if (sp && sp[0] == '0') spin_enabled = 0; }
     if (spin_enabled) { pthread_t th; if (pthread_create(&th, NULL, spinner, NULL)) spin_enabled = 0; else pthread_detach(th); }
     fprintf(stderr, "ready\n"); fflush(stderr);
     char req[4096], planpath[1024], arenapath[1024], outpath[1024];
     unsigned long out_off, out_n;
     while (fgets(req, sizeof req, stdin)) {
-        /* request: <plan> <arena_file> <arena_offset_floats> <out_file> <out_off> <out_n>  (offset form, persistent arena) */
-        unsigned long arena_off = 0;
+        /* request: <plan> <arena_file> <arena_offset_floats> <out_file> <out_off> <out_n>
+           or greedy argmax: argmax <plan> <arena_file> <arena_offset_floats> <out_off> <T> <V1> */
+        unsigned long arena_off = 0, arg_T = 0, arg_V1 = 0;
+        int greedy_mode = 0;
         if (!strncmp(req, "wake", 4)) { spin_set(1, 0.25); continue; }   /* no reply: the request follows */
-        if (sscanf(req, "%1023s %1023s %lu %1023s %lu %lu", planpath, arenapath, &arena_off, outpath, &out_off, &out_n) != 6) { printf("err bad request\n"); fflush(stdout); continue; }
+        if (!strncmp(req, "argmax ", 7)) {
+            if (sscanf(req + 7, "%1023s %1023s %lu %lu %lu %lu", planpath, arenapath, &arena_off, &out_off, &arg_T, &arg_V1) != 6) {
+                printf("err bad request\n"); fflush(stdout); continue;
+            }
+            greedy_mode = 1;
+            out_n = arg_T * arg_V1;
+        } else if (sscanf(req, "%1023s %1023s %lu %1023s %lu %lu", planpath, arenapath, &arena_off, outpath, &out_off, &out_n) != 6) {
+            printf("err bad request\n"); fflush(stdout); continue;
+        }
         double t0 = nowsec();
         spin_set(1, 30.0);
         f = fopen(arenapath, "rb"); size_t na = fread(A.map + arena_off, 4, ARENA_FLOATS - arena_off, f); fclose(f); (void)na;
         /* plan */
-        Op *ops = malloc(sizeof(Op) * 4096); int nops = 0; char line[2048];
+        int nops = 0; char line[2048];
         /* 2026-11-16 binary plan (*.bplan, gpuport.plan.Plan.write_bin): "GPB1", op count, then the Op structs as they are (172 bytes each) */
         size_t pl_ = strlen(planpath); int binplan = pl_ > 6 && !strcmp(planpath + pl_ - 6, ".bplan");
         f = fopen(planpath, binplan ? "rb" : "r");
         if (f && binplan) {
             uint32_t hd[2] = {0, 0};
-            if (fread(hd, 4, 2, f) != 2 || hd[0] != 0x31425047u || hd[1] > 4096 || fread(ops, sizeof(Op), hd[1], f) != hd[1]) { fclose(f); free(ops); spin_set(0, 0.0); printf("err bad binary plan\n"); fflush(stdout); continue; }
+            if (fread(hd, 4, 2, f) != 2 || hd[0] != 0x31425047u || hd[1] > 4096 || fread(ops, sizeof(Op), hd[1], f) != hd[1]) { fclose(f); spin_set(0, 0.0); printf("err bad binary plan\n"); fflush(stdout); continue; }
             nops = (int)hd[1]; for (int i = 0; i < nops; i++) ops[i].name[31] = 0;
         }
         while (f && !binplan && fgets(line, sizeof line, f)) {
@@ -212,21 +272,21 @@ int main(int argc, char **argv) {
         }
         if (f) fclose(f);
         CK(vkResetCommandPool(dev, pool, 0));
-        int ncb = 0, i0 = 0, need_wait = 0, nasm = 0; uint32_t h_prev = 0;
+        int ncb = 0, i0 = 0, need_wait = 0, nasm = 0, so_cur = 0; uint32_t h_prev = 0;
         CK(vkResetFences(dev, 1, &fence));
         for (int i = 0; i <= nops; i++) {
             int is_asm = (i < nops) && (!strcmp(ops[i].name, "qpu_mm") || !strcmp(ops[i].name, "qpu_mmrs") || !strcmp(ops[i].name, "qpu_mmrelu") || !strcmp(ops[i].name, "qpu_mmrm") || !strcmp(ops[i].name, "qpu_mmsk") || !strcmp(ops[i].name, "qpu_mmsilu") || !strcmp(ops[i].name, "qpu_mmh") || !strcmp(ops[i].name, "qpu_mmskh") || !strncmp(ops[i].name, "qpu4_", 5) || !strncmp(ops[i].name, "qpu1_", 5));
             if (i < nops && !is_asm) continue;
             /* ---- Vulkan segment [i0, i) ---- */
-            uint32_t h_in = 0; int made_in = 0;
+            uint32_t h_in = 0;
             if (i > i0) {
                 if (h_prev) {                                  /* previous asm job's completion becomes this segment's wait */
-                    int fd2 = syncobj_to_syncfile(h_prev); syncobj_free(h_prev); h_prev = 0;
+                    int fd2 = syncobj_to_syncfile(h_prev); h_prev = 0;
                     VkImportSemaphoreFdInfoKHR ii = { .sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR, .semaphore = semW, .flags = VK_SEMAPHORE_IMPORT_TEMPORARY_BIT, .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT, .fd = fd2 };
                     CK(isf(dev, &ii)); need_wait = 1;
                 }
-                VkCommandBufferAllocateInfo cba = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
-                VkCommandBuffer cb; CK(vkAllocateCommandBuffers(dev, &cba, &cb)); cbs[ncb++] = cb;
+                if (ncb >= 256) { fprintf(stderr, "too many Vulkan segments\n"); exit(1); }
+                VkCommandBuffer cb = cbs[ncb++];
                 VkCommandBufferBeginInfo cbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
                 CK(vkBeginCommandBuffer(cb, &cbi));
                 vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &ds, 0, NULL);
@@ -245,9 +305,9 @@ int main(int argc, char **argv) {
                 if (is_asm) {
                     VkSemaphoreGetFdInfoKHR gi = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR, .semaphore = semS, .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT };
                     int fd1 = -1; CK(gsf(dev, &gi, &fd1));
-                    h_in = syncobj_new(); made_in = 1; syncobj_from_syncfile(h_in, fd1); close(fd1);
+                    h_in = so_pool[so_cur]; so_cur ^= 1; syncobj_from_syncfile(h_in, fd1); close(fd1);
                 }
-            } else if (is_asm && h_prev) { h_in = h_prev; h_prev = 0; made_in = 1; }   /* two asm jobs in a row: chain on the previous out syncobj */
+            } else if (is_asm && h_prev) { h_in = h_prev; h_prev = 0; }   /* two asm jobs in a row: chain on the previous out syncobj */
             if (!is_asm) { if (i == nops && i == i0) { fprintf(stderr, "plan must end with a Vulkan op\n"); exit(1); } break; }
             /* ---- asm job ---- */
             /* qpu1_* (2026-11-16, qpu_mm1.py): 1 vector x 8 columns, row tails of <= 16 rows; same weight stream, uniforms and thread table as qpu4 with one block */
@@ -270,9 +330,8 @@ int main(int argc, char **argv) {
                 }
                 int img4 = !strcmp(ops[i].name + 5, "mmrelu") ? 1 : !strcmp(ops[i].name + 5, "mmrs") ? 2 : 0;
                 if (q1) img4 += 5;                             /* code images 11-13 (slots 5-7 of the 8 KB images) */
-                uint32_t h_out4 = syncobj_new();
+                uint32_t h_out4 = so_pool[so_cur]; so_cur ^= 1;
                 csd_submit(vaC + 196608 + img4 * 8192, vaC + 262144 + nasm * 512, h_in, h_out4);
-                if (made_in) syncobj_free(h_in);
                 h_prev = h_out4; nasm++; i0 = i + 1;
                 continue;
             }
@@ -283,22 +342,16 @@ int main(int argc, char **argv) {
             {   /* per-thread table: [m block base, first tile group, tile groups, tiles, valid m, passes, 0, 0]; blocks of 32 rows.
                    nblk <= 8: 8 // nblk tile groups share the n tiles; nblk > 8: every thread owns block t and repeats for passes of 256 rows */
                 uint32_t M = q[8], NTl = q[1], nblk = (M + 31) / 32; if (nblk < 1) nblk = 1; uint32_t *tb = pu + 16;
-                /* 2026-11-13 block passes: the kernel's pass loop now steps 32 rows, so a thread can sweep p consecutive row blocks.
-                   ng = ceil(nblk / p) block groups, G = 8 / ng tile groups per block group; per-thread work = p * ceil(NTl / G) tile passes.
-                   Pick the p with the least work (p = 1 is the old layout; ties keep the smaller p). Heads jobs use the pass loop for heads: p = 1.
-                   GPUPORT_BLOCKPASS=0: smallest feasible p only. */
                 int headsjob = !strcmp(ops[i].name, "qpu_mmh") || !strcmp(ops[i].name, "qpu_mmskh");
                 uint32_t bestp = 0, bestc = 0xffffffffu, pmin = (nblk + 7) / 8;
                 for (uint32_t pp = pmin; pp <= nblk; pp++) {
                     uint32_t ng = (nblk + pp - 1) / pp, G = 8 / ng, c = pp * ((NTl + G - 1) / G);
                     if (c < bestc) { bestc = c; bestp = pp; }
-                    if (headsjob || getenv("GPUPORT_BLOCKPASS_OFF")) break;
+                    if (headsjob || bp_off) break;
                 }
                 if (nblk > 256 / 32 * 4) { fprintf(stderr, "M too large\n"); exit(1); }
                 {
                     uint32_t ng = (nblk + bestp - 1) / bestp, G = 8 / ng;
-                    /* heads job writing whole tiles (push 17 = 1): the last tile of head h spills into tile 0 of head h + 1, so the same thread must
-                       own both (it then writes them in order): tile groups G must divide NTl - 1 */
                     if (headsjob && q[17]) while (G > 1 && (NTl - 1) % G) G--;
                     for (uint32_t t = 0; t < 8; t++) {
                         uint32_t bgrp = t % ng, g = t / ng;
@@ -311,18 +364,15 @@ int main(int argc, char **argv) {
                 pu[12] = vaC + 262144 + nasm * 512 + 64;
             }
             int img = !strcmp(ops[i].name, "qpu_mmrs") ? 1 : !strcmp(ops[i].name, "qpu_mmrelu") ? 2 : !strcmp(ops[i].name, "qpu_mmrm") ? 3 : !strcmp(ops[i].name, "qpu_mmsk") ? 4 : !strcmp(ops[i].name, "qpu_mmsilu") ? 5 : 0;
-            /* heads variants (2026-11-13): one job runs all attention heads (pass loop over heads); push 13 = heads, 14 / 15 / 16 = A, weight stream, out strides (floats) */
             int hd = !strcmp(ops[i].name, "qpu_mmh") ? 1 : !strcmp(ops[i].name, "qpu_mmskh") ? 2 : 0;
             if (hd == 2) img = 4;
             if (hd && q[8] > 256) { fprintf(stderr, "heads job: M %u > 256\n", q[8]); exit(1); }
-            if (img == 4) {   /* skewed position term: lane stride (TP+1) floats, key row stride TP floats, base moved back by R0 rows; table words 6, 7 = T, R0 */
+            if (img == 4) {
                 uint32_t TPf = q[5], LS = (TPf + 1) * 4, NS = TPf * 4, R0 = q[12];
                 pu[5] = vaA + (uint32_t)((int32_t)q[4] - (int32_t)(R0 * TPf)) * 4; pu[6] = LS; pu[7] = NS - 16 * LS; pu[8] = 16 * NS; pu[14] = 16 * LS;
                 for (uint32_t t = 0; t < 8; t++) { pu[16 + t * 8 + 6] = q[11]; pu[16 + t * 8 + 7] = R0; }
-                /* 2026-11-13: a block of 32 queries only needs the position columns r with 0 <= r - R0 + m < T, about T + 31 of the 2T - 1:
-                   give every thread just the tiles covering that range (first tile, stride G, count) instead of all tiles. GPUPORT_SK_FULL=1 = all tiles */
                 uint32_t Ms = q[8], NTs = q[1], nbs = (Ms + 31) / 32; if (nbs < 1) nbs = 1;
-                if (nbs <= 8 && !getenv("GPUPORT_SK_FULL")) {
+                if (nbs <= 8 && !sk_full) {
                     uint32_t Gs = 8 / nbs; int Tk = (int)q[11], R0i = (int)R0;
                     for (uint32_t t = 0; t < 8; t++) {
                         uint32_t b = t % nbs, g = t / nbs; uint32_t *row = pu + 16 + t * 8;
@@ -335,24 +385,38 @@ int main(int argc, char **argv) {
                     }
                 }
             }
-            if (img == 3) { pu[6] = OP; pu[7] = 4 - 16 * OP; pu[8] = 64; pu[14] = 16 * OP; }   /* row-major output: row bytes, step after odd acc, tile step, 16 rows */
-            if (hd) {   /* uniform layout of the heads kernels: word 4 = A stride, no M word; plain: 13 = W stride, 14 = out stride; skew: 13 = 16 * lane stride, 14, 15 = strides */
+            if (img == 3) { pu[6] = OP; pu[7] = 4 - 16 * OP; pu[8] = 64; pu[14] = 16 * OP; }
+            if (hd) {
                 uint32_t se = pu[14];
                 pu[4] = q[14] * 4;
                 if (hd == 1) { pu[13] = q[15] * 4; pu[14] = q[16] * 4; }
                 else { pu[13] = se; pu[14] = q[15] * 4; pu[15] = q[16] * 4; }
-                for (uint32_t t = 0; t < 8; t++) if (pu[16 + t * 8 + 4]) pu[16 + t * 8 + 5] = q[13];   /* active threads: passes = heads */
+                for (uint32_t t = 0; t < 8; t++) if (pu[16 + t * 8 + 4]) pu[16 + t * 8 + 5] = q[13];
             }
-            uint32_t h_out = syncobj_new();
+            uint32_t h_out = so_pool[so_cur]; so_cur ^= 1;
             csd_submit(hd ? vaC + 196608 + (2 + hd) * 8192 : vaC + img * 32768, vaC + 262144 + nasm * 512, h_in, h_out);
-            if (made_in) syncobj_free(h_in);
             h_prev = h_out; nasm++; i0 = i + 1;
         }
         CK(vkWaitForFences(dev, 1, &fence, VK_TRUE, 120ull * 1000000000ull));
         spin_set(0, 0.0);
-        f = fopen(outpath, "wb"); fwrite(A.map + out_off, 4, out_n, f); fclose(f);
-        free(ops);
-        printf("done %.1f\n", (nowsec() - t0) * 1e3); fflush(stdout);
+        if (greedy_mode) {
+            if (arg_V1 > rd_cap) { free(rd_buf); rd_cap = arg_V1; rd_buf = malloc(rd_cap * 4); }
+            int prev_tok = -1, blank = (int)arg_V1 - 1, first_tok = 1;
+            printf("done %.1f", (nowsec() - t0) * 1e3);
+            for (unsigned long t = 0; t < arg_T; t++) {
+                copy_from_wc(rd_buf, A.map + out_off + t * arg_V1, arg_V1 * 4);
+                int a = argmax_f32(rd_buf, (int)arg_V1);
+                if (a != prev_tok && a != blank) { printf("%c%d", first_tok ? ' ' : ',', a); first_tok = 0; }
+                prev_tok = a;
+            }
+            printf("\n"); fflush(stdout);
+        } else {
+            if (out_n > rd_cap) { free(rd_buf); rd_cap = out_n; rd_buf = malloc(rd_cap * 4); }
+            copy_from_wc(rd_buf, A.map + out_off, out_n * 4);
+            f = fopen(outpath, "wb"); fwrite(rd_buf, 4, out_n, f); fclose(f);
+            printf("done %.1f\n", (nowsec() - t0) * 1e3); fflush(stdout);
+        }
     }
+    free(ops); free(rd_buf);
     return 0;
 }

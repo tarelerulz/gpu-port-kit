@@ -112,6 +112,47 @@ class ExecServer:
             out = np.fromfile(base + '.out', '<f4')
         return out, float(resp.split()[1])
 
+    def run_bplan(self, bplan_bytes, arena_init, out_off, out_n, greedy_shape=None):
+        """Fast path for pre-serialized binary plan bytes (exec_hybrid only, 2026-11-20).
+        If greedy_shape=(T, V1) is given, asks exec_hybrid to do NEON write-combined readback + CTC greedy
+        argmax+collapse in C and returns (token_id_list, server_ms) without writing/reading the 1 MB logits file."""
+        arena_init = np.asarray(arena_init, np.float32).ravel()
+        if arena_init.size > SERVER_ARENA_FLOATS or out_off + out_n > SERVER_ARENA_FLOATS:
+            raise MemoryError('arena beyond the server arena (24M floats)')
+        with self.lock:
+            self.start()
+            self.seq += 1
+            base = os.path.join(self.io_dir(), f'srv_{self.seq % 4}')
+            ppath = base + '.bplan'
+            with open(ppath, 'wb') as f:
+                f.write(bplan_bytes)
+            arena_init.astype('<f4').tofile(base + '.arena')
+            marker = last_reset_marker()
+            if greedy_shape is not None:
+                T_, V1_ = greedy_shape
+                self.proc.stdin.write(f'argmax {ppath} {base}.arena 0 {out_off} {T_} {V1_}\n')
+            else:
+                self.proc.stdin.write(f'{ppath} {base}.arena 0 {base}.out {out_off} {out_n}\n')
+            self.proc.stdin.flush()
+            resp = self.proc.stdout.readline()
+            try:
+                if not resp.startswith('done'):
+                    if resp.strip():
+                        raise RuntimeError('exec_server2: ' + resp.strip())
+                    raise RuntimeError('exec_server2: server exited (GPU error). Kernel: '
+                                       + gpu_reason_since(marker))
+                check_no_reset(marker)
+            except (RuntimeError, GpuHang):
+                self.stop()
+                raise
+            parts = resp.strip().split()
+            ms = float(parts[1])
+            if greedy_shape is not None:
+                ids = [int(x) for x in parts[2].split(',')] if len(parts) > 2 else []
+                return ids, ms
+            out = np.fromfile(base + '.out', '<f4')
+        return out, ms
+
     def stop(self):
         if self.proc is not None and self.proc.poll() is None:
             self.proc.stdin.close(); self.proc.wait(timeout=20)
