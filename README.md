@@ -50,6 +50,7 @@ The resident server source is in `runner/exec_server2.c`; build it with `sh tool
 ## Map of the GPU
 - `OIDO_GPU_STORY.md`: the whole history of the Oido port in plain words (3.3 s -> 0.54 s for 10 s of speech), what worked and what did not.
 - `V3D_FINDINGS.md`: the short technical write-up of the V3D findings.
+- `GPU_RULES.md`: short rules for compute on the Pi 4/400 GPU: correctness traps, measured speed rules, hung jobs reporting success, clock and governor notes.
 - `GPU_MAP.md`: how the device, plans, memory and layouts work, with measured speed and known gaps. Read this first.
 - `GPU_SHADERS.md`: generated catalog of every shader (local size, bindings, push words). Regenerate: `python3 tools/catalog_shaders.py`.
 - `GPU_TIMINGS_T251.md`: per-op timings at nemo8 shapes. Regenerate: `python3 tools/bench_ops.py 251`.
